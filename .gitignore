@@ -1,0 +1,13 @@
+# Secrets — never commit
+.env
+
+# Runtime state
+allemail.json
+allemail.json.*.tmp
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

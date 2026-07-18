@@ -1,0 +1,23 @@
+# TObot — Lark email-search bot (persistent connection)
+# Install on the server:
+#   sudo cp /root/TObot/tobot.service /etc/systemd/system/tobot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tobot.service
+# Logs:
+#   journalctl -u tobot.service -f
+
+[Unit]
+Description=TObot Lark email search bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/TObot
+ExecStart=/usr/bin/python3 /root/TObot/main.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
