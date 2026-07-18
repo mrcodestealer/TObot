@@ -14,6 +14,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/root/TObot
+# Needs Python 3.9+. If the system /usr/bin/python3 is older (SyntaxError on
+# "from __future__ import annotations"), point ExecStart at the conda python:
+#   sed -i "s|ExecStart=.*|ExecStart=$(which python3) /root/TObot/main.py|" /etc/systemd/system/tobot.service
+# (run while the (base) conda env is active, then systemctl daemon-reload)
 ExecStart=/usr/bin/python3 /root/TObot/main.py
 Restart=always
 RestartSec=10
