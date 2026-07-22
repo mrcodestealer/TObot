@@ -9,7 +9,7 @@ Lark chat.
 | Command | What it does |
 |---|---|
 | `/search <email title>` | Fuzzy search by subject — lists matches with their Message-IDs |
-| `/search <exact full title>` | Exact-title mode: ONE card with every copy of exactly that email (similar titles excluded), identical contents deduped |
+| `/search <exact full title>` | Thread mode: ONE card with the whole conversation — the original + every Re:/Fwd: reply, oldest first (similar-but-different titles excluded, identical contents deduped) |
 | `/search <Message-ID>` | Exact lookup (most accurate) — shows sender, To/Cc, date, folder and content |
 | `/search <No.>` | Open result N from your previous `/search` listing |
 | `@TObot <email title>` | Same as `/search` (in P2P chat just type the title) |

@@ -994,6 +994,23 @@ def _fmt_date(entry: dict[str, Any]) -> str:
     return datetime.fromtimestamp(ts, _local_tz()).strftime("%Y-%m-%d %H:%M")
 
 
+# Reply/forward prefixes (incl. Chinese) stripped when comparing thread titles.
+_SUBJECT_PREFIX_RE = re.compile(
+    r"^\s*(?:(?:re|fw|fwd|aw|回复|回覆|转发|轉發|答复|答覆)\s*(?:\[\d+\])?\s*[::])\s*", re.I
+)
+
+
+def _base_subject(s: str) -> str:
+    """Whitespace-normalized subject with all Re:/Fwd: prefixes stripped."""
+    s = re.sub(r"\s+", " ", (s or "").strip())
+    while True:
+        t = _SUBJECT_PREFIX_RE.sub("", s)
+        if t == s:
+            break
+        s = t
+    return s.casefold()
+
+
 def _score_subject(subject: str, query: str) -> int:
     # Whitespace-normalized so pasted titles (line wraps, collapsed double
     # spaces) still count as an exact match.
@@ -1036,15 +1053,31 @@ def _search_entries(
         for e in reversed(emails):  # newest copy wins
             if _normalize_mid(e.get("message_id")) == qmid:
                 return e, [], False, 1
+    # Thread-exact: query equals a subject up to Re:/Fwd: prefixes and
+    # whitespace — return the WHOLE conversation (original + every reply),
+    # oldest first, deduped by Message-ID.
+    qbase = _base_subject(query)
+    if qbase:
+        thread: dict[str, dict[str, Any]] = {}
+        for e in emails:
+            if _base_subject(e.get("subject") or "") != qbase:
+                continue
+            k = entry_key(e)
+            prev = thread.get(k)
+            if prev is None or float(e.get("date_ts") or 0.0) >= float(prev.get("date_ts") or 0.0):
+                thread[k] = e
+        if thread:
+            ordered = sorted(thread.values(), key=lambda e: float(e.get("date_ts") or 0.0))
+            total = len(ordered)
+            if total > SEARCH_MAX_RESULTS:
+                ordered = ordered[-SEARCH_MAX_RESULTS:]  # keep the newest N
+            return None, ordered, True, total
     scored: list[tuple[int, float, dict[str, Any]]] = []
     for e in emails:
         sc = _score_subject(e.get("subject") or "", query)
         if sc >= 30:
             scored.append((sc, float(e.get("date_ts") or 0.0), e))
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    exact_title = bool(scored) and scored[0][0] == 100
-    if exact_title:
-        scored = [t for t in scored if t[0] == 100]
     # Dedup by key (same Message-ID seen in several folders).
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
@@ -1057,7 +1090,7 @@ def _search_entries(
         total += 1
         if len(out) < SEARCH_MAX_RESULTS:
             out.append(e)
-    return None, out, exact_title, total
+    return None, out, False, total
 
 
 def _format_details(entry: dict[str, Any]) -> str:
@@ -1265,7 +1298,8 @@ def handle_search(chat_id: str, query: str) -> tuple[str, Any]:
             "Tips: try fewer words from the title, or paste the exact Message-ID.\n"
             "A /scan forces a fresh mailbox re-scan.")
     if exact_title:
-        # Exact title match: ONE card with every copy of exactly this email.
+        # Exact title match: ONE card with the whole conversation — the
+        # original email plus every Re:/Fwd: copy, oldest first.
         with _last_results_lock:
             _last_results[chat_id] = [entry_key(e) for e in results]
         return "card", (results[0].get("subject") or query, results, total)
@@ -1305,7 +1339,8 @@ HELP_TEXT = (
     "──────────\n"
     "/search <email title> — the title finds the email's Message-ID, then the ID\n"
     "  retrieves that exact email's content live from the mailbox\n"
-    "/search <exact full title> — ONE card with every copy of exactly that email\n"
+    "/search <exact full title> — ONE card with the whole conversation\n"
+    "  (the original email + every Re:/Fwd: reply, oldest first)\n"
     "/search <Message-ID> — direct exact lookup (the accurate key)\n"
     "/search <No.> — open result N from your last search listing\n"
     "@TObot <email title> — same as /search (in P2P just type the title)\n"
