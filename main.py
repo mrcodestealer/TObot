@@ -88,8 +88,11 @@ SCAN_INTERVAL_SEC = max(60, int(_env("TOBOT_SCAN_INTERVAL_SEC", default="300")))
 SCAN_CAP_PER_FOLDER = min(20000, max(50, int(_env("TOBOT_SCAN_CAP_PER_FOLDER", default="3000"))))
 BODY_FETCH_CAP_PER_SCAN = max(20, int(_env("TOBOT_BODY_FETCH_CAP", default="500")))
 MAX_ENTRIES = min(100000, max(200, int(_env("TOBOT_MAX_ENTRIES", default="20000"))))
-BODY_STORE_MAX_CHARS = max(500, int(_env("TOBOT_BODY_MAX_CHARS", default="6000")))
+BODY_STORE_MAX_CHARS = max(500, int(_env("TOBOT_BODY_MAX_CHARS", default="40000")))
+# Text-fallback trim only — cards always show the full stored body (paginated).
 BODY_SHOW_MAX_CHARS = max(300, int(_env("TOBOT_BODY_SHOW_CHARS", default="3000")))
+# Body/meta chars per card — stays safely under Lark's ~30KB card limit.
+CARD_CHARS_BUDGET = max(4000, int(_env("TOBOT_CARD_CHARS", default="18000")))
 SEARCH_MAX_RESULTS = max(3, int(_env("TOBOT_SEARCH_MAX_RESULTS", default="10")))
 IMAP_TIMEOUT = max(10, int(_env("TOBOT_IMAP_TIMEOUT", default="60")))
 
@@ -321,8 +324,7 @@ def extract_body_text(msg: email.message.Message) -> str:
             html = _decode_part(msg)
         elif msg.get_content_maintype() == "text":
             plain = _decode_part(msg)
-    text = plain.strip() or _html_to_text(html)
-    return text[:BODY_STORE_MAX_CHARS]
+    return plain.strip() or _html_to_text(html)
 
 
 def _addr_list(raw: str) -> list[str]:
@@ -371,10 +373,14 @@ def message_to_entry(msg: email.message.Message, *, folder: str, uid: str,
     }
     if with_body:
         try:
-            entry["body"] = extract_body_text(msg)
+            text = extract_body_text(msg)
         except Exception as ex:
             print(f"[index] body extract failed ({folder}:{uid}): {ex!r}", flush=True)
-            entry["body"] = ""
+            text = ""
+        # body_full also marks the entry as new-format: entries stored before
+        # this flag existed may hold a cut body and get one live re-fetch on open.
+        entry["body_full"] = len(text) <= BODY_STORE_MAX_CHARS
+        entry["body"] = text[:BODY_STORE_MAX_CHARS]
     return entry
 
 
@@ -390,17 +396,28 @@ def entry_key(entry: dict[str, Any]) -> str:
     return f"sub:{subj}:{int(float(entry.get('date_ts') or 0.0))}"
 
 
+# In-memory copy of allemail.json — with full bodies the file runs tens of MB,
+# far too heavy to re-parse from disk on every /search. Disk is only read once
+# (startup) and written on save; all reads/writes hold _store_lock.
+_index_cache: Optional[dict[str, Any]] = None
+
+
 def _load_index() -> dict[str, Any]:
+    global _index_cache
+    if _index_cache is not None:
+        return _index_cache
     try:
         with open(STORE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict) and isinstance(data.get("emails"), list):
+            _index_cache = data
             return data
     except FileNotFoundError:
         pass
     except Exception as ex:
         print(f"[index] load failed ({ex!r}) — starting empty", flush=True)
-    return {"version": 1, "updated_at": "", "emails": []}
+    _index_cache = {"version": 1, "updated_at": "", "emails": []}
+    return _index_cache
 
 
 def _window_cutoff_ts() -> float:
@@ -419,6 +436,7 @@ def _entry_alive_ts(e: dict[str, Any]) -> float:
 
 
 def _save_index(emails: list[dict[str, Any]]) -> None:
+    global _index_cache
     cutoff = _window_cutoff_ts()
     fresh = [e for e in emails if _entry_alive_ts(e) >= cutoff]
     fresh.sort(key=lambda e: float(e.get("date_ts") or 0.0))
@@ -431,10 +449,11 @@ def _save_index(emails: list[dict[str, Any]]) -> None:
         "count": len(fresh),
         "emails": fresh,
     }
+    _index_cache = data
     tmp = f"{STORE_PATH}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
         os.replace(tmp, STORE_PATH)
     finally:
         try:
@@ -461,9 +480,13 @@ def _merge_and_save(new_entries: list[dict[str, Any]]) -> None:
             if float(e.get("date_ts") or 0.0) >= float(prev.get("date_ts") or 0.0):
                 if "body" not in e and "body" in prev:
                     e = {**e, "body": prev["body"]}
+                    if "body_full" in prev:
+                        e["body_full"] = prev["body_full"]
                 merged[key] = e
             elif "body" in e and "body" not in prev:
                 prev["body"] = e["body"]
+                if "body_full" in e:
+                    prev["body_full"] = e["body_full"]
         _save_index(list(merged.values()))
 
 
@@ -841,7 +864,12 @@ def fetch_bodies_live(entries: list[dict[str, Any]], limit: int = 5) -> list[dic
     the content immediately instead of "(body not fetched yet)". Fetched bodies
     are merged into the index. Best-effort: any failure keeps the original entry.
     """
-    need = [e for e in entries if "body" not in e and e.get("uid") and e.get("folder")]
+    # Refetch when the body was never fetched, OR when the entry predates the
+    # body_full flag (stored before full-body storage — may be cut at 6000).
+    need = [
+        e for e in entries
+        if ("body" not in e or "body_full" not in e) and e.get("uid") and e.get("folder")
+    ]
     if not need:
         return entries
     updated: dict[str, dict[str, Any]] = {}
@@ -1040,21 +1068,48 @@ def _entry_by_key(key: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def _card_for_entries(title: str, entries: list[dict[str, Any]],
-                      total: Optional[int] = None) -> dict[str, Any]:
-    """Lark interactive card: one section per email copy, identical bodies deduped."""
+def _split_body(body: str, budget: int) -> list[str]:
+    """Split a long body into chunks ≤ budget, preferring newline boundaries."""
+    chunks: list[str] = []
+    pos = 0
+    while pos < len(body):
+        end = pos + budget
+        if end < len(body):
+            nl = body.rfind("\n", pos + budget // 2, end)
+            if nl > pos:
+                end = nl
+        chunks.append(body[pos:end].strip("\n"))
+        pos = end
+    return chunks or [""]
+
+
+def _cards_for_entries(title: str, entries: list[dict[str, Any]],
+                       total: Optional[int] = None) -> list[dict[str, Any]]:
+    """Lark interactive cards showing the FULL content of every email copy.
+
+    Identical bodies are deduped; whatever doesn't fit under Lark's per-card
+    size limit continues in follow-up cards ("card 2/N").
+    """
     n = len(entries)
-    per = max(400, min(BODY_SHOW_MAX_CHARS, 24000 // max(1, n)))
-    elements: list[dict[str, Any]] = []
+    pages: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_size = 0
+
+    def emit(element: dict[str, Any], size: int) -> None:
+        nonlocal cur, cur_size
+        if cur and cur_size + size > CARD_CHARS_BUDGET:
+            pages.append(cur)
+            cur, cur_size = [], 0
+        cur.append(element)
+        cur_size += size
+
     if total and total > n:
-        elements.append({
-            "tag": "markdown",
-            "content": f"*(showing the newest {n} of {total} emails with this title)*",
-        })
+        note = f"*(showing the newest {n} of {total} emails with this title)*"
+        emit({"tag": "markdown", "content": note}, len(note))
     seen_bodies: dict[str, int] = {}
     for i, e in enumerate(entries, 1):
         if i > 1:
-            elements.append({"tag": "hr"})
+            emit({"tag": "hr"}, 20)
         meta = []
         if n > 1:
             meta.append(f"**#{i}**")
@@ -1066,7 +1121,8 @@ def _card_for_entries(title: str, entries: list[dict[str, Any]],
         meta.append(f"**Date:** {_fmt_date(e)} ({MAIL_TZ})")
         meta.append(f"**Folder:** {e.get('folder') or '?'}")
         meta.append(f"**Message-ID:** {e.get('message_id') or '(none)'}")
-        elements.append({"tag": "markdown", "content": "\n".join(meta)})
+        meta_md = "\n".join(meta)
+        emit({"tag": "markdown", "content": meta_md}, len(meta_md))
         body = (e.get("body") or "").strip()
         if not body:
             body = ("(this email has no text content — probably attachment-only)"
@@ -1078,17 +1134,32 @@ def _card_for_entries(title: str, entries: list[dict[str, Any]],
                 body = f"(same content as #{prev})"
             else:
                 seen_bodies[body] = i
-                if len(body) > per:
-                    body = body[:per].rstrip() + "\n… (trimmed)"
-        elements.append({"tag": "markdown", "content": body})
-    return {
-        "config": {"wide_screen_mode": True},
-        "header": {
-            "title": {"tag": "plain_text", "content": f"📧 {title}"[:150]},
-            "template": "blue",
-        },
-        "elements": elements,
-    }
+                if not e.get("body_full", True):
+                    body += f"\n… (email longer than {BODY_STORE_MAX_CHARS} chars — cut here)"
+        parts = _split_body(body, CARD_CHARS_BUDGET)
+        for k, piece in enumerate(parts, 1):
+            if len(parts) > 1:
+                piece = f"*(content part {k}/{len(parts)})*\n" + piece
+            emit({"tag": "markdown", "content": piece}, len(piece))
+    pages.append(cur)
+    cards: list[dict[str, Any]] = []
+    for p, elements in enumerate(pages, 1):
+        head = f"📧 {title}" if len(pages) == 1 else f"📧 {title} ({p}/{len(pages)})"
+        cards.append({
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text", "content": head[:150]},
+                "template": "blue",
+            },
+            "elements": elements,
+        })
+    return cards
+
+
+def _card_for_entries(title: str, entries: list[dict[str, Any]],
+                      total: Optional[int] = None) -> dict[str, Any]:
+    """First card only — kept for compatibility (tests/fallbacks)."""
+    return _cards_for_entries(title, entries, total)[0]
 
 
 def handle_search(chat_id: str, query: str) -> tuple[str, Any]:
@@ -1163,12 +1234,17 @@ def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
         return
     title, entries, total = payload
     entries = fetch_bodies_live(entries)
-    if reply_card(chat_id, message_id, _card_for_entries(title, entries, total)):
+    cards = _cards_for_entries(title, entries, total)
+    if not reply_card(chat_id, message_id, cards[0]):
+        # Card rejected (e.g. missing permission) — plain-text fallback.
+        note = f"(+{len(entries) - 1} more copies of this title — card view failed)\n\n" \
+            if len(entries) > 1 else ""
+        reply_text(chat_id, message_id, note + _format_details(entries[0]))
         return
-    # Card rejected (e.g. missing permission) — plain-text fallback.
-    note = f"(+{len(entries) - 1} more copies of this title — card view failed)\n\n" \
-        if len(entries) > 1 else ""
-    reply_text(chat_id, message_id, note + _format_details(entries[0]))
+    for card in cards[1:]:
+        if not reply_card(chat_id, message_id, card):
+            print("[lark] follow-up card failed — remaining content dropped", flush=True)
+            break
 
 
 # ===================== Command router =====================
