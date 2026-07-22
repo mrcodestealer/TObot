@@ -771,6 +771,8 @@ def scan_mailbox() -> tuple[int, int]:
         all_entries: list[dict[str, Any]] = []
         folder_stats: dict[str, Any] = {}
         started = time.monotonic()
+        _last_scan_info["running_since"] = datetime.now(timezone.utc).isoformat()
+        print(f"[scan] starting — folders={_folders_label()}", flush=True)
         mail = _connect_imap()
         try:
             # (display_name, raw_select_name|None) per folder this scan covers.
@@ -789,6 +791,11 @@ def scan_mailbox() -> tuple[int, int]:
                     got = _scan_folder(mail, folder, known_keys, body_budget, raw_name=raw_name)
                     all_entries.extend(got)
                     folder_stats[folder] = len(got)
+                    print(
+                        f"[scan] {folder}: {len(got)} in window "
+                        f"(body budget left this scan: {body_budget[0]})",
+                        flush=True,
+                    )
                 except ImapStaleConnectionError as ex:
                     # Dead/hung socket: every further op would block IMAP_TIMEOUT
                     # while holding _scan_lock — abort, keep what we got,
@@ -813,17 +820,21 @@ def scan_mailbox() -> tuple[int, int]:
             "error": "",
             "folders": folder_stats,
             "duration_sec": int(time.monotonic() - started),
+            "running_since": "",
         })
         return len(all_entries), new_bodies
 
 
 def _scanner_daemon() -> None:
+    print("[scan] first scan of a fresh index backfills the whole "
+          f"{WINDOW_DAYS}-day window — this can take several minutes", flush=True)
     while True:
         try:
             seen, new_bodies = scan_mailbox()
             print(f"[scan] ok — {seen} in window, {new_bodies} new bodies fetched", flush=True)
         except Exception as ex:
             _last_scan_info["error"] = repr(ex)
+            _last_scan_info["running_since"] = ""
             print(f"[scan] failed: {ex!r}", flush=True)
         time.sleep(SCAN_INTERVAL_SEC)
 
@@ -1043,6 +1054,9 @@ def _status_text() -> str:
     if not stats and not SCAN_ALL_FOLDERS:
         for folder in IMAP_FOLDERS:
             lines.append(f"  {folder}: (not scanned)")
+    if last.get("running_since"):
+        lines.append(f"⏳ Scan in progress since {last['running_since']} — "
+                     "the first one backfills the whole window and can take several minutes.")
     if last.get("error"):
         lines.append(f"Last scan error: {last['error']}")
     return "\n".join(lines)
