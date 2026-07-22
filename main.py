@@ -100,7 +100,9 @@ _HEADER_FETCH_SPEC = (
 
 def _default_folders() -> list[str]:
     raw = _env("TOBOT_IMAP_FOLDERS", "ALLEMAIL_IMAP_FOLDERS", "JENKINS_REPLY_IMAP_FOLDERS",
-               default="INBOX,Sent")
+               default="*")
+    if raw.strip() in ("*", "ALL", "all"):
+        return ["*"]
     seen: set[str] = set()
     out: list[str] = []
     for f in raw.split(","):
@@ -112,6 +114,19 @@ def _default_folders() -> list[str]:
 
 
 IMAP_FOLDERS = _default_folders()
+SCAN_ALL_FOLDERS = IMAP_FOLDERS == ["*"]
+# Folders skipped in "*" mode (matched against the decoded display name).
+IMAP_EXCLUDE = {
+    f.strip().casefold()
+    for f in _env("TOBOT_IMAP_EXCLUDE", default="Spam,Trash,Drafts,Junk,Deleted Messages").split(",")
+    if f.strip()
+}
+
+
+def _folders_label() -> str:
+    if SCAN_ALL_FOLDERS:
+        return f"ALL folders (except {', '.join(sorted(IMAP_EXCLUDE))})"
+    return ", ".join(IMAP_FOLDERS)
 
 _store_lock = threading.Lock()
 _scan_lock = threading.Lock()
@@ -543,6 +558,34 @@ def _parse_uid_fetch(data: list) -> dict[bytes, bytes]:
     return out
 
 
+def _imap_utf7_decode(name: str) -> str:
+    """IMAP modified-UTF-7 → readable text (e.g. 'IGO&jURukFIpdShUaGKl-' → 'IGO资源利用周报')."""
+    out: list[str] = []
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch != "&":
+            out.append(ch)
+            i += 1
+            continue
+        j = name.find("-", i + 1)
+        if j < 0:
+            out.append(name[i:])
+            break
+        b64 = name[i + 1:j]
+        if not b64:
+            out.append("&")
+        else:
+            try:
+                pad = "=" * ((4 - len(b64) % 4) % 4)
+                raw = base64.b64decode(b64.replace(",", "/") + pad)
+                out.append(raw.decode("utf-16-be"))
+            except Exception:
+                out.append(name[i:j + 1])
+        i = j + 1
+    return "".join(out)
+
+
 def _imap_list_folder_names(mail: imaplib.IMAP4) -> list[str]:
     """Actual mailbox names on the server (LIST), for resolving UI labels."""
     names: list[str] = []
@@ -570,19 +613,23 @@ def _imap_list_folder_names(mail: imaplib.IMAP4) -> list[str]:
 
 
 def _match_folder_candidates(want: str, names: list[str]) -> list[str]:
-    """Server folder names that could be the configured label, best match first."""
+    """Server folder names (raw) that could be the configured label, best first.
+
+    Matches against both the raw name and its modified-UTF-7 decoded form, so a
+    label like "IGO资源利用周报" finds the encoded "IGO&jURukFIpdShUaGKl-".
+    """
     want_cf = (want or "").casefold()
     want_flat = want_cf.replace(" ", "")
+    forms = [(n, {n.casefold(), _imap_utf7_decode(n).casefold()}) for n in names]
     out: list[str] = []
-    for name in names:
-        if name.casefold() == want_cf and name not in out:
+    for name, cfs in forms:
+        if want_cf in cfs and name not in out:
             out.append(name)
-    for name in names:
-        if name.casefold().replace(" ", "") == want_flat and name not in out:
+    for name, cfs in forms:
+        if want_flat in {c.replace(" ", "") for c in cfs} and name not in out:
             out.append(name)
-    for name in names:
-        nc = name.casefold()
-        if (want_cf in nc or nc in want_cf) and name not in out:
+    for name, cfs in forms:
+        if any(want_cf in c or c in want_cf for c in cfs) and name not in out:
             out.append(name)
     return out
 
@@ -622,12 +669,16 @@ def _select_folder_resolved(mail: imaplib.IMAP4, folder: str) -> str:
 
 
 def _scan_folder(mail: imaplib.IMAP4, folder: str,
-                 known_keys: set[str], body_budget: list[int]) -> list[dict[str, Any]]:
-    selected = _select_folder_resolved(mail, folder)
+                 known_keys: set[str], body_budget: list[int],
+                 raw_name: Optional[str] = None) -> list[dict[str, Any]]:
+    if raw_name is not None:
+        selected = raw_name if _try_select(mail, raw_name) else ""
+    else:
+        selected = _select_folder_resolved(mail, folder)
     if not selected:
         print(f"[scan] SELECT {folder!r} not OK — skipped", flush=True)
         return []
-    folder = selected
+    folder = _imap_utf7_decode(selected)
     uids = _uid_search(mail, f"(SINCE {_since_date()})")
     if not uids:
         return []
@@ -722,9 +773,20 @@ def scan_mailbox() -> tuple[int, int]:
         started = time.monotonic()
         mail = _connect_imap()
         try:
-            for folder in IMAP_FOLDERS:
+            # (display_name, raw_select_name|None) per folder this scan covers.
+            if SCAN_ALL_FOLDERS:
+                todo = [
+                    (_imap_utf7_decode(raw), raw)
+                    for raw in _imap_list_folder_names(mail)
+                    if _imap_utf7_decode(raw).casefold() not in IMAP_EXCLUDE
+                ]
+                if not todo:
+                    print("[scan] LIST returned no folders — nothing to scan", flush=True)
+            else:
+                todo = [(f, None) for f in IMAP_FOLDERS]
+            for folder, raw_name in todo:
                 try:
-                    got = _scan_folder(mail, folder, known_keys, body_budget)
+                    got = _scan_folder(mail, folder, known_keys, body_budget, raw_name=raw_name)
                     all_entries.extend(got)
                     folder_stats[folder] = len(got)
                 except ImapStaleConnectionError as ex:
@@ -955,7 +1017,7 @@ HELP_TEXT = (
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
     "──────────\n"
-    f"Mailbox: {MAIL_USER or '(not set)'} | Folders: {', '.join(IMAP_FOLDERS)}\n"
+    f"Mailbox: {MAIL_USER or '(not set)'} | Folders: {_folders_label()}\n"
     f"Retention: last {WINDOW_DAYS} days, re-scan every {SCAN_INTERVAL_SEC // 60} min"
 )
 
@@ -970,13 +1032,17 @@ def _status_text() -> str:
         "TObot status 📮",
         f"Indexed emails: {n} (window {WINDOW_DAYS}d, cap {MAX_ENTRIES})",
         f"Index updated: {upd}",
+        f"Folders: {_folders_label()}",
         f"Last scan: {last.get('when') or '(not yet)'} — "
         f"{last.get('scanned', 0)} in window, {last.get('new_bodies', 0)} new bodies, "
         f"{last.get('duration_sec', 0)}s",
     ]
     stats = last.get("folders") or {}
-    for folder in IMAP_FOLDERS:
-        lines.append(f"  {folder}: {stats.get(folder, '(not scanned)')}")
+    for folder, count in stats.items():
+        lines.append(f"  {folder}: {count}")
+    if not stats and not SCAN_ALL_FOLDERS:
+        for folder in IMAP_FOLDERS:
+            lines.append(f"  {folder}: (not scanned)")
     if last.get("error"):
         lines.append(f"Last scan error: {last['error']}")
     return "\n".join(lines)
@@ -1275,7 +1341,7 @@ def main() -> int:
         return 1
     print(
         f"[tobot] mailbox={MAIL_USER} imap={MAIL_IMAP_HOST}:{MAIL_IMAP_PORT} "
-        f"folders={IMAP_FOLDERS} window={WINDOW_DAYS}d interval={SCAN_INTERVAL_SEC}s",
+        f"folders={_folders_label()} window={WINDOW_DAYS}d interval={SCAN_INTERVAL_SEC}s",
         flush=True,
     )
     threading.Thread(target=_scanner_daemon, daemon=True, name="scanner").start()
