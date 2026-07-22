@@ -33,9 +33,11 @@ from __future__ import annotations
 import base64
 import email
 import email.message
+import hashlib
 import html as html_lib
 import http
 import imaplib
+import io
 import json
 import os
 import re
@@ -99,6 +101,13 @@ BODY_SHOW_MAX_CHARS = max(300, int(_env("TOBOT_BODY_SHOW_CHARS", default="3000")
 CARD_CHARS_BUDGET = max(4000, int(_env("TOBOT_CARD_CHARS", default="18000")))
 # Recently fetched contents kept in memory so re-opening an email is instant.
 BODY_CACHE_MAX = max(20, int(_env("TOBOT_BODY_CACHE_MAX", default="300")))
+
+# Inline images: extract from the email, upload to Lark, embed in the card.
+SHOW_IMAGES = _env("TOBOT_SHOW_IMAGES", default="1").lower() not in ("0", "false", "no", "off")
+IMAGES_PER_EMAIL = max(0, int(_env("TOBOT_IMAGES_PER_EMAIL", default="8")))
+IMAGE_MIN_BYTES = max(0, int(_env("TOBOT_IMAGE_MIN_BYTES", default="2000")))
+IMAGE_MAX_BYTES = max(10000, int(_env("TOBOT_IMAGE_MAX_BYTES", default="9000000")))
+CARD_IMAGES_MAX = max(1, int(_env("TOBOT_CARD_IMAGES_MAX", default="24")))
 SEARCH_MAX_RESULTS = max(3, int(_env("TOBOT_SEARCH_MAX_RESULTS", default="10")))
 # Exact-title / thread mode shows the WHOLE conversation, so it gets a much
 # larger cap than the fuzzy picker listing (which is just a menu).
@@ -268,6 +277,64 @@ def remove_reaction(message_id: str, reaction_id: str) -> None:
         print(f"[lark] remove reaction failed: {ex!r}", flush=True)
 
 
+# ===================== Image upload (inline email images → Lark) =====================
+_img_key_cache: "OrderedDict[str, str]" = OrderedDict()   # sha256(bytes) → Lark image_key
+_img_key_lock = threading.Lock()
+_IMG_EXT = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+            "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp"}
+
+
+def upload_image_bytes(data: bytes, mime: str) -> str:
+    """Upload raw image bytes to Lark; returns image_key ('' on failure)."""
+    token = get_tenant_access_token()
+    if not token:
+        return ""
+    ext = _IMG_EXT.get((mime or "").lower(), "png")
+    try:
+        resp = requests.post(
+            "https://open.larksuite.com/open-apis/im/v1/images",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"image": (f"image.{ext}", io.BytesIO(data), mime or "image/png")},
+            data={"image_type": "message"},
+            timeout=30,
+        ).json()
+    except Exception as ex:
+        print(f"[img] upload failed: {ex!r}", flush=True)
+        return ""
+    if resp.get("code") == 0:
+        return str((resp.get("data") or {}).get("image_key") or "")
+    print(f"[img] upload rejected: {resp.get('code')} {resp.get('msg')}", flush=True)
+    return ""
+
+
+def _prepare_image_keys(images: list[tuple[str, bytes]]) -> list[str]:
+    """Upload each usable image (deduped by content hash, cached) → image_keys."""
+    if not SHOW_IMAGES or not images:
+        return []
+    keys: list[str] = []
+    for mime, data in images:
+        if len(keys) >= IMAGES_PER_EMAIL:
+            break
+        if not data or len(data) < IMAGE_MIN_BYTES or len(data) > IMAGE_MAX_BYTES:
+            continue
+        h = hashlib.sha256(data).hexdigest()
+        with _img_key_lock:
+            key = _img_key_cache.get(h)
+            if key:
+                _img_key_cache.move_to_end(h)
+        if not key:
+            key = upload_image_bytes(data, mime)
+            if key:
+                with _img_key_lock:
+                    _img_key_cache[h] = key
+                    _img_key_cache.move_to_end(h)
+                    while len(_img_key_cache) > 1000:
+                        _img_key_cache.popitem(last=False)
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 # ===================== Email parsing =====================
 def _decode_hdr(raw: Optional[str]) -> str:
     if not raw:
@@ -311,29 +378,55 @@ def _decode_part(part: email.message.Message) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
+# Inline-image placeholder tokens senders' clients leave in the plain-text
+# alternative ("[image]", "[image: logo.png]", "[cid:xxx]") — noise once the
+# real images are shown, so they're removed from the displayed text.
+_IMG_PLACEHOLDER_RE = re.compile(r"\[\s*(?:image|cid)\b[^\]]*\]", re.I)
+_DATA_URI_RE = re.compile(r"data:image/(png|jpe?g|gif|webp|bmp);base64,([A-Za-z0-9+/=\s]+)", re.I)
+
+
+def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str, bytes]]]:
+    """(body_text, [(mime, bytes), ...]) — text plus every inline/attached image."""
+    plain, html = "", ""
+    images: list[tuple[str, bytes]] = []
+    parts = list(msg.walk()) if msg.is_multipart() else [msg]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        ctype = (part.get_content_type() or "").lower()
+        if part.get_content_maintype() == "image":
+            try:
+                data = part.get_payload(decode=True)
+            except Exception:
+                data = None
+            if data:
+                images.append((ctype, data))
+            continue
+        disp = str(part.get("Content-Disposition") or "").lower()
+        if "attachment" in disp:
+            continue
+        if ctype == "text/plain" and not plain:
+            plain = _decode_part(part)
+        elif ctype == "text/html" and not html:
+            html = _decode_part(part)
+    text = plain.strip() or _html_to_text(html)
+    # Images embedded directly in the HTML as data: URIs.
+    if html:
+        for m in _DATA_URI_RE.finditer(html):
+            try:
+                images.append((f"image/{m.group(1).lower().replace('jpg', 'jpeg')}",
+                               base64.b64decode(re.sub(r"\s+", "", m.group(2)))))
+            except Exception:
+                pass
+    # Drop [image]/[cid:…] placeholder tokens now that real images are shown.
+    text = _IMG_PLACEHOLDER_RE.sub("", text)
+    text = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", text).strip()
+    return text, images
+
+
 def extract_body_text(msg: email.message.Message) -> str:
     """Prefer text/plain; fall back to text/html stripped to text."""
-    plain, html = "", ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.is_multipart():
-                continue
-            disp = str(part.get("Content-Disposition") or "").lower()
-            if "attachment" in disp:
-                continue
-            ctype = part.get_content_type()
-            if ctype == "text/plain" and not plain:
-                plain = _decode_part(part)
-            elif ctype == "text/html" and not html:
-                html = _decode_part(part)
-    else:
-        # Single-part: only decode text/* — a lone binary attachment must not
-        # be stored as mojibake "content".
-        if msg.get_content_type() == "text/html":
-            html = _decode_part(msg)
-        elif msg.get_content_maintype() == "text":
-            plain = _decode_part(msg)
-    return plain.strip() or _html_to_text(html)
+    return extract_email_parts(msg)[0]
 
 
 def _addr_list(raw: str) -> list[str]:
@@ -808,12 +901,12 @@ def scan_mailbox() -> int:
 
 
 # Recently fetched contents — re-opening the same email is instant, and the
-# index itself stays headers-only.
-_body_cache: OrderedDict[str, tuple[str, bool]] = OrderedDict()
+# index itself stays headers-only. Value: (body, body_full, image_keys).
+_body_cache: "OrderedDict[str, tuple[str, bool, list[str]]]" = OrderedDict()
 _body_cache_lock = threading.Lock()
 
 
-def _body_cache_get(key: str) -> Optional[tuple[str, bool]]:
+def _body_cache_get(key: str) -> Optional[tuple[str, bool, list[str]]]:
     with _body_cache_lock:
         hit = _body_cache.get(key)
         if hit is not None:
@@ -821,9 +914,9 @@ def _body_cache_get(key: str) -> Optional[tuple[str, bool]]:
         return hit
 
 
-def _body_cache_put(key: str, body: str, full: bool) -> None:
+def _body_cache_put(key: str, body: str, full: bool, image_keys: list[str]) -> None:
     with _body_cache_lock:
-        _body_cache[key] = (body, full)
+        _body_cache[key] = (body, full, image_keys)
         _body_cache.move_to_end(key)
         while len(_body_cache) > BODY_CACHE_MAX:
             _body_cache.popitem(last=False)
@@ -880,10 +973,12 @@ def _mid_search_needles(mid: str) -> list[str]:
     return out
 
 
-def _fetch_content_for_entry(mail: imaplib.IMAP4, e: dict[str, Any]) -> Optional[str]:
-    """Retrieve one email's content — by stored folder+uid first, then by
-    Message-ID search (the accurate key) if the email moved. Either way the
-    fetched message's Message-ID must match the entry's before it is shown."""
+def _fetch_content_for_entry(
+    mail: imaplib.IMAP4, e: dict[str, Any]
+) -> Optional[email.message.Message]:
+    """Retrieve one email — by stored folder+uid first, then by Message-ID
+    search (the accurate key) if the email moved. Either way the fetched
+    message's Message-ID must match the entry's before it is returned."""
     mid = (e.get("message_id") or "").strip()
     want = _normalize_mid(mid)
     # Fast path: the folder+uid recorded at scan time.
@@ -894,7 +989,7 @@ def _fetch_content_for_entry(mail: imaplib.IMAP4, e: dict[str, Any]) -> Optional
                 fmid = _normalize_mid(msg.get("Message-ID"))
                 # uid still points at the right email unless mids disagree
                 if not want or not fmid or fmid == want:
-                    return extract_body_text(msg)
+                    return msg
     # Accurate path: find the email by its Message-ID wherever it lives now.
     # HEADER search is substring-based, so every hit is verified against the
     # exact Message-ID before its content is accepted (and cached upstream).
@@ -912,7 +1007,7 @@ def _fetch_content_for_entry(mail: imaplib.IMAP4, e: dict[str, Any]) -> Optional
             for uid_b in list(reversed(uids))[:5]:
                 msg = _fetch_uid_body(mail, uid_b.decode(errors="replace"))
                 if msg is not None and _normalize_mid(msg.get("Message-ID")) == want:
-                    return extract_body_text(msg)
+                    return msg
     return None
 
 
@@ -929,7 +1024,8 @@ def fetch_contents(entries: list[dict[str, Any]], limit: int = 5) -> list[dict[s
         key = entry_key(e)
         cached = _body_cache_get(key)
         if cached is not None:
-            out[key] = {**e, "body": cached[0], "body_full": cached[1]}
+            out[key] = {**e, "body": cached[0], "body_full": cached[1],
+                        "image_keys": cached[2]}
         elif len(need) < limit:
             need.append(e)
     if need:
@@ -941,17 +1037,20 @@ def fetch_contents(entries: list[dict[str, Any]], limit: int = 5) -> list[dict[s
         if mail is not None:
             try:
                 for e in need:
-                    text = _fetch_content_for_entry(mail, e)
+                    msg = _fetch_content_for_entry(mail, e)
                     key = entry_key(e)
-                    if text is None:
+                    if msg is None:
                         # Attempted but not found anywhere — genuinely missing
                         # (distinct from "never attempted": limit/stale abort).
                         out[key] = {**e, "fetch_missing": True}
                         continue
+                    text, images = extract_email_parts(msg)
+                    image_keys = _prepare_image_keys(images)
                     full = len(text) <= BODY_STORE_MAX_CHARS
                     text = text[:BODY_STORE_MAX_CHARS]
-                    _body_cache_put(key, text, full)
-                    out[key] = {**e, "body": text, "body_full": full}
+                    _body_cache_put(key, text, full, image_keys)
+                    out[key] = {**e, "body": text, "body_full": full,
+                                "image_keys": image_keys}
             except ImapStaleConnectionError as ex:
                 print(f"[live-fetch] {ex}", flush=True)
             finally:
@@ -1228,6 +1327,8 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
         note = f"*(showing the newest {n} of {total} emails with this title)*"
         emit({"tag": "markdown", "content": note}, len(note))
     seen_bodies: dict[str, int] = {}
+    shown_imgs: set[str] = set()   # dedupe repeated images (e.g. signature logos) per card
+    img_budget = [CARD_IMAGES_MAX]
     for i, e in enumerate(entries, 1):
         if i > 1:
             emit({"tag": "hr"}, 20)
@@ -1240,8 +1341,11 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
         meta_md = "\n".join(meta)
         emit({"tag": "markdown", "content": meta_md}, len(meta_md))
         body = _display_body(e)
+        has_imgs = bool(e.get("image_keys"))
         if not body:
-            if "body" in e:
+            if has_imgs:
+                body = ""   # image-only email — the pictures below are the content
+            elif "body" in e:
                 body = "(this email has no text content — probably attachment-only)"
             elif e.get("fetch_missing"):
                 body = ("(this email couldn't be found in the mailbox anymore — "
@@ -1256,11 +1360,28 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
                 seen_bodies[body] = i
                 if not e.get("body_full", True):
                     body += f"\n… (email longer than {BODY_STORE_MAX_CHARS} chars — cut here)"
-        parts = _split_body(body, CARD_CHARS_BUDGET)
-        for k, piece in enumerate(parts, 1):
-            if len(parts) > 1:
-                piece = f"*(content part {k}/{len(parts)})*\n" + piece
-            emit({"tag": "markdown", "content": piece}, len(piece))
+        if body:
+            parts = _split_body(body, CARD_CHARS_BUDGET)
+            for k, piece in enumerate(parts, 1):
+                if len(parts) > 1:
+                    piece = f"*(content part {k}/{len(parts)})*\n" + piece
+                emit({"tag": "markdown", "content": piece}, len(piece))
+        # Inline images uploaded for this email — each unique one shown once
+        # per card (repeated signature logos collapse to one).
+        for img_key in e.get("image_keys") or []:
+            if img_budget[0] <= 0:
+                break
+            if img_key in shown_imgs:
+                continue
+            shown_imgs.add(img_key)
+            img_budget[0] -= 1
+            emit({
+                "tag": "img",
+                "img_key": img_key,
+                "alt": {"tag": "plain_text", "content": "email image"},
+                "mode": "fit_horizontal",
+                "preview": True,
+            }, 300)
     pages.append(cur)
     cards: list[dict[str, Any]] = []
     for p, elements in enumerate(pages, 1):
