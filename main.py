@@ -100,6 +100,9 @@ CARD_CHARS_BUDGET = max(4000, int(_env("TOBOT_CARD_CHARS", default="18000")))
 # Recently fetched contents kept in memory so re-opening an email is instant.
 BODY_CACHE_MAX = max(20, int(_env("TOBOT_BODY_CACHE_MAX", default="300")))
 SEARCH_MAX_RESULTS = max(3, int(_env("TOBOT_SEARCH_MAX_RESULTS", default="10")))
+# Exact-title / thread mode shows the WHOLE conversation, so it gets a much
+# larger cap than the fuzzy picker listing (which is just a menu).
+THREAD_MAX_RESULTS = max(SEARCH_MAX_RESULTS, int(_env("TOBOT_THREAD_MAX_RESULTS", default="60")))
 IMAP_TIMEOUT = max(10, int(_env("TOBOT_IMAP_TIMEOUT", default="60")))
 
 _HEADER_FETCH_SPEC = (
@@ -1069,8 +1072,8 @@ def _search_entries(
         if thread:
             ordered = sorted(thread.values(), key=lambda e: float(e.get("date_ts") or 0.0))
             total = len(ordered)
-            if total > SEARCH_MAX_RESULTS:
-                ordered = ordered[-SEARCH_MAX_RESULTS:]  # keep the newest N
+            if total > THREAD_MAX_RESULTS:
+                ordered = ordered[-THREAD_MAX_RESULTS:]  # keep the newest N
             return None, ordered, True, total
     scored: list[tuple[int, float, dict[str, Any]]] = []
     for e in emails:
