@@ -26,12 +26,16 @@ Typical flow: `/search evolution maintenance` → pick from the listing →
 
 ## How it works
 
-- A background thread logs into IMAP (`imap.larksuite.com`) every
-  `TOBOT_SCAN_INTERVAL_SEC` (default 5 min), lists everything in
-  `TOBOT_IMAP_FOLDERS` from the last `TOBOT_WINDOW_DAYS` (default 180) days,
-  and stores subject / Message-ID / From / To / Cc / date / folder / body
-  into `allemail.json` (atomic writes, deduped by Message-ID).
-- Bodies are fetched **only for new emails** (bounded per scan), so scans stay cheap.
+- The index tracks **email title → Message-ID** (plus From/To/date/folder).
+  A background thread logs into IMAP (`imap.larksuite.com`) every
+  `TOBOT_SCAN_INTERVAL_SEC` (default 5 min) and refreshes headers for the last
+  `TOBOT_WINDOW_DAYS` (default 180) days into `allemail.json` (atomic writes,
+  deduped by Message-ID). No bodies are stored, so scans are fast and the
+  index stays small.
+- `/search <title>` resolves the title to its Message-ID, then uses that ID to
+  retrieve the exact email **live from the mailbox** (by its recorded
+  folder/uid, falling back to a Message-ID search if the email moved) and
+  shows the full content. Recently opened emails are cached in memory.
 - Lark events arrive through a **persistent connection** (WebSocket) — no
   public Request URL / port forwarding needed. In the Lark developer console
   set: *Event subscriptions → Receive events through persistent connection*

@@ -4,12 +4,14 @@ TObot — Lark bot that indexes ALL emails from the duty mailbox and makes them
 searchable from chat.
 
 Mirrored from osedutybot's ``allemail.json`` 1-week email index
-(maintenance_mail.py), extended for TObot:
+(maintenance_mail.py), adapted for TObot:
 
-* Stores the email BODY too (osedutybot stores headers only), so ``/search``
-  can show who sent the email and what content is inside.
-* Rolling retention window (``TOBOT_WINDOW_DAYS``, default 30 days) instead of
-  osedutybot's hard weekly reset — this bot is a search archive.
+* The index tracks TITLE → MESSAGE-ID only (plus From/To/date/folder/uid).
+  ``/search <title>`` resolves the title to its Message-ID, then uses that ID
+  to retrieve the exact email's content LIVE from the mailbox at view time
+  (in-memory cache only — nothing persisted).
+* Rolling retention window (``TOBOT_WINDOW_DAYS``, default 180 days) instead
+  of osedutybot's hard weekly reset — this bot is a search archive.
 
 Commands (group chat or P2P):
     /search <email title>   fuzzy search by subject; lists matches with their
@@ -86,13 +88,17 @@ STORE_PATH = os.path.join(_ROOT, "allemail.json")
 WINDOW_DAYS = min(365, max(1, int(_env("TOBOT_WINDOW_DAYS", default="180"))))
 SCAN_INTERVAL_SEC = max(60, int(_env("TOBOT_SCAN_INTERVAL_SEC", default="300")))
 SCAN_CAP_PER_FOLDER = min(20000, max(50, int(_env("TOBOT_SCAN_CAP_PER_FOLDER", default="3000"))))
-BODY_FETCH_CAP_PER_SCAN = max(20, int(_env("TOBOT_BODY_FETCH_CAP", default="500")))
 MAX_ENTRIES = min(100000, max(200, int(_env("TOBOT_MAX_ENTRIES", default="20000"))))
+# The index stores ONLY titles + Message-IDs (+ From/To/date/folder/uid).
+# Email content is fetched live from IMAP at view time; these caps bound that
+# runtime fetch, nothing is persisted.
 BODY_STORE_MAX_CHARS = max(500, int(_env("TOBOT_BODY_MAX_CHARS", default="40000")))
-# Text-fallback trim only — cards always show the full stored body (paginated).
+# Text-fallback trim only — cards always show the full fetched body (paginated).
 BODY_SHOW_MAX_CHARS = max(300, int(_env("TOBOT_BODY_SHOW_CHARS", default="3000")))
 # Body/meta chars per card — stays safely under Lark's ~30KB card limit.
 CARD_CHARS_BUDGET = max(4000, int(_env("TOBOT_CARD_CHARS", default="18000")))
+# Recently fetched contents kept in memory so re-opening an email is instant.
+BODY_CACHE_MAX = max(20, int(_env("TOBOT_BODY_CACHE_MAX", default="300")))
 SEARCH_MAX_RESULTS = max(3, int(_env("TOBOT_SEARCH_MAX_RESULTS", default="10")))
 IMAP_TIMEOUT = max(10, int(_env("TOBOT_IMAP_TIMEOUT", default="60")))
 
@@ -134,7 +140,7 @@ def _folders_label() -> str:
 _store_lock = threading.Lock()
 _scan_lock = threading.Lock()
 _last_scan_info: dict[str, Any] = {
-    "when": "", "scanned": 0, "new_bodies": 0, "error": "",
+    "when": "", "scanned": 0, "error": "",
     "folders": {}, "duration_sec": 0,
 }
 
@@ -337,7 +343,9 @@ def message_to_entry(msg: email.message.Message, *, folder: str, uid: str,
     from_raw = _decode_hdr(msg.get("From"))
     to_raw = _decode_hdr(msg.get("To"))
     cc_raw = _decode_hdr(msg.get("Cc"))
-    mid = (msg.get("Message-ID") or "").strip()
+    # Message-IDs legally contain no whitespace — collapsing it also removes
+    # CRLF artifacts from folded headers (they would corrupt IMAP SEARCH).
+    mid = re.sub(r"\s+", "", msg.get("Message-ID") or "")
     date_raw = (msg.get("Date") or "").strip()
     ts, date_iso = 0.0, ""
     if date_raw:
@@ -396,9 +404,9 @@ def entry_key(entry: dict[str, Any]) -> str:
     return f"sub:{subj}:{int(float(entry.get('date_ts') or 0.0))}"
 
 
-# In-memory copy of allemail.json — with full bodies the file runs tens of MB,
-# far too heavy to re-parse from disk on every /search. Disk is only read once
-# (startup) and written on save; all reads/writes hold _store_lock.
+# In-memory copy of allemail.json so /search never re-parses the file from
+# disk. Disk is read once (startup) and written on save; all reads/writes
+# hold _store_lock.
 _index_cache: Optional[dict[str, Any]] = None
 
 
@@ -463,30 +471,25 @@ def _save_index(emails: list[dict[str, Any]]) -> None:
             pass
 
 
+def _strip_runtime_fields(e: dict[str, Any]) -> dict[str, Any]:
+    """Index entries persist headers only — body/body_full live in the runtime cache."""
+    if "body" in e or "body_full" in e:
+        return {k: v for k, v in e.items() if k not in ("body", "body_full")}
+    return e
+
+
 def _merge_and_save(new_entries: list[dict[str, Any]]) -> None:
     with _store_lock:
         merged: dict[str, dict[str, Any]] = {}
         for e in _load_index().get("emails", []):
-            merged[entry_key(e)] = e
+            merged[entry_key(e)] = _strip_runtime_fields(e)
         for e in new_entries:
+            e = _strip_runtime_fields(e)
             key = entry_key(e)
             prev = merged.get(key)
-            if prev is None:
+            # Newest wins per key.
+            if prev is None or float(e.get("date_ts") or 0.0) >= float(prev.get("date_ts") or 0.0):
                 merged[key] = e
-                continue
-            # Newest wins, but never lose an already-fetched body. "body" key
-            # present = body was fetched (even if it extracted to "" — e.g.
-            # attachment-only mail); key absent = header-only entry.
-            if float(e.get("date_ts") or 0.0) >= float(prev.get("date_ts") or 0.0):
-                if "body" not in e and "body" in prev:
-                    e = {**e, "body": prev["body"]}
-                    if "body_full" in prev:
-                        e["body_full"] = prev["body_full"]
-                merged[key] = e
-            elif "body" in e and "body" not in prev:
-                prev["body"] = e["body"]
-                if "body_full" in e:
-                    prev["body_full"] = e["body_full"]
         _save_index(list(merged.values()))
 
 
@@ -701,8 +704,12 @@ def _select_folder_resolved(mail: imaplib.IMAP4, folder: str) -> str:
 
 
 def _scan_folder(mail: imaplib.IMAP4, folder: str,
-                 known_keys: set[str], body_budget: list[int],
                  raw_name: Optional[str] = None) -> list[dict[str, Any]]:
+    """Header-only index scan: title + Message-ID (+ From/To/date/folder/uid).
+
+    Content is never fetched here — /search resolves a title to its Message-ID
+    and pulls the email body live from IMAP at view time.
+    """
     if raw_name is not None:
         selected = raw_name if _try_select(mail, raw_name) else ""
     else:
@@ -716,9 +723,7 @@ def _scan_folder(mail: imaplib.IMAP4, folder: str,
         return []
     if len(uids) > SCAN_CAP_PER_FOLDER:
         uids = uids[-SCAN_CAP_PER_FOLDER:]
-
-    # Pass 1 — cheap header fetch for everything in the window.
-    headers: dict[bytes, dict[str, Any]] = {}
+    entries: list[dict[str, Any]] = []
     chunk = 50
     for off in range(0, len(uids), chunk):
         part = uids[off:off + chunk]
@@ -735,71 +740,19 @@ def _scan_folder(mail: imaplib.IMAP4, folder: str,
         for uid_b, raw in _parse_uid_fetch(data).items():
             try:
                 msg = email.message_from_bytes(raw)
-                headers[uid_b] = message_to_entry(
-                    msg, folder=folder, uid=uid_b.decode(errors="replace"), with_body=False
-                )
-            except Exception:
-                continue
-
-    # Pass 2 — full body fetch only for messages whose body was never fetched
-    # ("body" key absent in the index). Newest first, so during a cold-start
-    # backfill the emails people actually /search get their bodies first.
-    # The budget caps attempts per scan but is only spent on SUCCESSFUL
-    # fetches — a failed chunk gets retried next scan instead of burning cap.
-    need_body: list[bytes] = []
-    for uid_b in reversed(headers):
-        if len(need_body) >= body_budget[0]:
-            break
-        if entry_key(headers[uid_b]) not in known_keys:
-            need_body.append(uid_b)
-    entries: list[dict[str, Any]] = []
-    fetched_body_uids: set[bytes] = set()
-    chunk = 10
-    for off in range(0, len(need_body), chunk):
-        part = need_body[off:off + chunk]
-        uid_str = b",".join(part).decode()
-        try:
-            typ, data = mail.uid("fetch", uid_str, "(BODY.PEEK[])")
-        except Exception as ex:
-            if _imap_connection_broken(ex):
-                raise ImapStaleConnectionError(f"connection lost during body fetch: {ex!r}") from ex
-            print(f"[scan] body fetch failed in {folder!r}: {ex!r}", flush=True)
-            continue
-        if typ != "OK" or not data:
-            continue
-        for uid_b, raw in _parse_uid_fetch(data).items():
-            try:
-                msg = email.message_from_bytes(raw)
                 entries.append(message_to_entry(
-                    msg, folder=folder, uid=uid_b.decode(errors="replace"), with_body=True
+                    msg, folder=folder, uid=uid_b.decode(errors="replace"), with_body=False
                 ))
-                fetched_body_uids.add(uid_b)
             except Exception:
                 continue
-    body_budget[0] -= len(fetched_body_uids)
-    for uid_b, entry in headers.items():
-        if uid_b not in fetched_body_uids:
-            entries.append(entry)
-    # Only body-carrying entries count as "known" — header-only ones must stay
-    # eligible for a body fetch on the next scan / in a later folder.
-    for e in entries:
-        if "body" in e:
-            known_keys.add(entry_key(e))
     return entries
 
 
-def scan_mailbox() -> tuple[int, int]:
-    """One full scan of all folders. Returns (entries_seen, new_bodies_fetched)."""
+def scan_mailbox() -> int:
+    """One header-only scan of all folders. Returns entries seen in window."""
     if not (MAIL_USER and MAIL_PASSWORD):
         raise RuntimeError("MAIL_USER / MAIL_PASSWORD not set in .env")
     with _scan_lock:
-        with _store_lock:
-            known_keys = {
-                entry_key(e)
-                for e in _load_index().get("emails", [])
-                if "body" in e  # body fetched (even if empty text) → skip
-            }
-        body_budget = [BODY_FETCH_CAP_PER_SCAN]
         all_entries: list[dict[str, Any]] = []
         folder_stats: dict[str, Any] = {}
         started = time.monotonic()
@@ -820,14 +773,10 @@ def scan_mailbox() -> tuple[int, int]:
                 todo = [(f, None) for f in IMAP_FOLDERS]
             for folder, raw_name in todo:
                 try:
-                    got = _scan_folder(mail, folder, known_keys, body_budget, raw_name=raw_name)
+                    got = _scan_folder(mail, folder, raw_name=raw_name)
                     all_entries.extend(got)
                     folder_stats[folder] = len(got)
-                    print(
-                        f"[scan] {folder}: {len(got)} in window "
-                        f"(body budget left this scan: {body_budget[0]})",
-                        flush=True,
-                    )
+                    print(f"[scan] {folder}: {len(got)} in window", flush=True)
                 except ImapStaleConnectionError as ex:
                     # Dead/hung socket: every further op would block IMAP_TIMEOUT
                     # while holding _scan_lock — abort, keep what we got,
@@ -844,87 +793,181 @@ def scan_mailbox() -> tuple[int, int]:
             except Exception:
                 pass
         _merge_and_save(all_entries)
-        new_bodies = BODY_FETCH_CAP_PER_SCAN - body_budget[0]
         _last_scan_info.update({
             "when": datetime.now(timezone.utc).isoformat(),
             "scanned": len(all_entries),
-            "new_bodies": new_bodies,
             "error": "",
             "folders": folder_stats,
             "duration_sec": int(time.monotonic() - started),
             "running_since": "",
         })
-        return len(all_entries), new_bodies
+        return len(all_entries)
 
 
-def fetch_bodies_live(entries: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
-    """On-demand body fetch for entries the backfill hasn't reached yet.
+# Recently fetched contents — re-opening the same email is instant, and the
+# index itself stays headers-only.
+_body_cache: OrderedDict[str, tuple[str, bool]] = OrderedDict()
+_body_cache_lock = threading.Lock()
 
-    Called from the /search path right before showing a card, so the user sees
-    the content immediately instead of "(body not fetched yet)". Fetched bodies
-    are merged into the index. Best-effort: any failure keeps the original entry.
-    """
-    # Refetch when the body was never fetched, OR when the entry predates the
-    # body_full flag (stored before full-body storage — may be cut at 6000).
-    need = [
-        e for e in entries
-        if ("body" not in e or "body_full" not in e) and e.get("uid") and e.get("folder")
-    ]
-    if not need:
-        return entries
-    updated: dict[str, dict[str, Any]] = {}
+
+def _body_cache_get(key: str) -> Optional[tuple[str, bool]]:
+    with _body_cache_lock:
+        hit = _body_cache.get(key)
+        if hit is not None:
+            _body_cache.move_to_end(key)
+        return hit
+
+
+def _body_cache_put(key: str, body: str, full: bool) -> None:
+    with _body_cache_lock:
+        _body_cache[key] = (body, full)
+        _body_cache.move_to_end(key)
+        while len(_body_cache) > BODY_CACHE_MAX:
+            _body_cache.popitem(last=False)
+
+
+def _fetch_uid_body(mail: imaplib.IMAP4, uid: str) -> Optional[email.message.Message]:
     try:
-        mail = _connect_imap()
+        typ, data = mail.uid("fetch", str(uid), "(BODY.PEEK[])")
     except Exception as ex:
-        print(f"[live-fetch] connect failed: {ex!r}", flush=True)
-        return entries
-    try:
-        by_folder: dict[str, list[dict[str, Any]]] = {}
-        for e in need[:limit]:
-            by_folder.setdefault(e["folder"], []).append(e)
-        for folder, ents in by_folder.items():
-            selected = _select_folder_resolved(mail, folder)
-            if not selected:
-                continue
-            uid_str = ",".join(str(e["uid"]) for e in ents)
-            try:
-                typ, data = mail.uid("fetch", uid_str, "(BODY.PEEK[])")
-            except Exception as ex:
-                print(f"[live-fetch] fetch failed in {folder!r}: {ex!r}", flush=True)
-                continue
-            if typ != "OK" or not data:
-                continue
-            for uid_b, raw in _parse_uid_fetch(data).items():
-                try:
-                    msg = email.message_from_bytes(raw)
-                    ne = message_to_entry(
-                        msg, folder=_imap_utf7_decode(selected),
-                        uid=uid_b.decode(errors="replace"), with_body=True,
-                    )
-                    updated[entry_key(ne)] = ne
-                except Exception:
-                    continue
-    except ImapStaleConnectionError as ex:
-        print(f"[live-fetch] {ex}", flush=True)
-    finally:
+        if _imap_connection_broken(ex):
+            raise ImapStaleConnectionError(f"connection lost during body fetch: {ex!r}") from ex
+        print(f"[live-fetch] uid fetch failed: {ex!r}", flush=True)
+        return None
+    if typ != "OK" or not data:
+        return None
+    for _uid_b, raw in _parse_uid_fetch(data).items():
         try:
-            mail.logout()
+            return email.message_from_bytes(raw)
         except Exception:
-            pass
-    if not updated:
+            return None
+    return None
+
+
+# At most this many folders are searched per entry on the Message-ID fallback
+# path, so one /search can't turn into hundreds of IMAP round-trips.
+LIVE_FETCH_FOLDER_CAP = max(2, int(_env("TOBOT_LIVE_FETCH_FOLDERS", default="6")))
+
+
+def _search_folders_for_live_fetch(mail: imaplib.IMAP4, first: str) -> list[str]:
+    if SCAN_ALL_FOLDERS:
+        names = [
+            _imap_utf7_decode(raw)
+            for raw in _imap_list_folder_names(mail)
+            if _imap_utf7_decode(raw).casefold() not in IMAP_EXCLUDE
+        ]
+    else:
+        names = list(IMAP_FOLDERS)
+    out = [first] if first else []
+    for n in names:
+        if n.casefold() != (first or "").casefold():
+            out.append(n)
+    return out[:LIVE_FETCH_FOLDER_CAP]
+
+
+def _mid_search_needles(mid: str) -> list[str]:
+    """Safe SEARCH needles for a Message-ID: quotes/backslashes removed (they
+    corrupt the IMAP quoted string — cf. osedutybot's needle sanitizing), and
+    empty needles dropped ('' substring-matches EVERY message)."""
+    out: list[str] = []
+    for cand in (mid, mid.strip("<>")):
+        cand = re.sub(r'[\s"\\]+', "", cand)
+        if cand and cand.strip("<>") and cand not in out:
+            out.append(cand)
+    return out
+
+
+def _fetch_content_for_entry(mail: imaplib.IMAP4, e: dict[str, Any]) -> Optional[str]:
+    """Retrieve one email's content — by stored folder+uid first, then by
+    Message-ID search (the accurate key) if the email moved. Either way the
+    fetched message's Message-ID must match the entry's before it is shown."""
+    mid = (e.get("message_id") or "").strip()
+    want = _normalize_mid(mid)
+    # Fast path: the folder+uid recorded at scan time.
+    if e.get("folder") and e.get("uid"):
+        if _select_folder_resolved(mail, e["folder"]):
+            msg = _fetch_uid_body(mail, str(e["uid"]))
+            if msg is not None:
+                fmid = _normalize_mid(msg.get("Message-ID"))
+                # uid still points at the right email unless mids disagree
+                if not want or not fmid or fmid == want:
+                    return extract_body_text(msg)
+    # Accurate path: find the email by its Message-ID wherever it lives now.
+    # HEADER search is substring-based, so every hit is verified against the
+    # exact Message-ID before its content is accepted (and cached upstream).
+    needles = _mid_search_needles(mid)
+    if want and needles:
+        for folder in _search_folders_for_live_fetch(mail, e.get("folder") or ""):
+            if not _select_folder_resolved(mail, folder):
+                continue
+            uids: list[bytes] = []
+            for needle in needles:
+                uids = _uid_search(mail, f'(HEADER Message-ID "{needle}")')
+                if uids:
+                    break
+            # Newest hits first; substring matches are rejected by the check.
+            for uid_b in list(reversed(uids))[:5]:
+                msg = _fetch_uid_body(mail, uid_b.decode(errors="replace"))
+                if msg is not None and _normalize_mid(msg.get("Message-ID")) == want:
+                    return extract_body_text(msg)
+    return None
+
+
+def fetch_contents(entries: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    """Attach live-fetched content to index entries before display.
+
+    The index maps title → Message-ID; this resolves each Message-ID to the
+    actual email on the server and retrieves its content. Cached in memory,
+    never persisted. Best-effort: failures keep the entry content-less.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    need: list[dict[str, Any]] = []
+    for e in entries:
+        key = entry_key(e)
+        cached = _body_cache_get(key)
+        if cached is not None:
+            out[key] = {**e, "body": cached[0], "body_full": cached[1]}
+        elif len(need) < limit:
+            need.append(e)
+    if need:
+        try:
+            mail = _connect_imap()
+        except Exception as ex:
+            print(f"[live-fetch] connect failed: {ex!r}", flush=True)
+            mail = None
+        if mail is not None:
+            try:
+                for e in need:
+                    text = _fetch_content_for_entry(mail, e)
+                    key = entry_key(e)
+                    if text is None:
+                        # Attempted but not found anywhere — genuinely missing
+                        # (distinct from "never attempted": limit/stale abort).
+                        out[key] = {**e, "fetch_missing": True}
+                        continue
+                    full = len(text) <= BODY_STORE_MAX_CHARS
+                    text = text[:BODY_STORE_MAX_CHARS]
+                    _body_cache_put(key, text, full)
+                    out[key] = {**e, "body": text, "body_full": full}
+            except ImapStaleConnectionError as ex:
+                print(f"[live-fetch] {ex}", flush=True)
+            finally:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
+    if not out:
         return entries
-    _merge_and_save(list(updated.values()))
-    print(f"[live-fetch] fetched {len(updated)} body(ies) on demand", flush=True)
-    return [updated.get(entry_key(e), e) for e in entries]
+    return [out.get(entry_key(e), e) for e in entries]
 
 
 def _scanner_daemon() -> None:
-    print("[scan] first scan of a fresh index backfills the whole "
-          f"{WINDOW_DAYS}-day window — this can take several minutes", flush=True)
+    print(f"[scan] header-only index (titles + Message-IDs) over the "
+          f"{WINDOW_DAYS}-day window — content is fetched live at /search time", flush=True)
     while True:
         try:
-            seen, new_bodies = scan_mailbox()
-            print(f"[scan] ok — {seen} in window, {new_bodies} new bodies fetched", flush=True)
+            seen = scan_mailbox()
+            print(f"[scan] ok — {seen} emails indexed in window", flush=True)
         except Exception as ex:
             _last_scan_info["error"] = repr(ex)
             _last_scan_info["running_since"] = ""
@@ -1024,8 +1067,10 @@ def _format_details(entry: dict[str, Any]) -> str:
     if not body:
         if "body" in entry:
             body = "(this email has no text content — probably attachment-only)"
+        elif entry.get("fetch_missing"):
+            body = "(this email couldn't be found in the mailbox anymore — it may have been deleted)"
         else:
-            body = "(body not fetched yet — try /scan then /search again)"
+            body = "(content not loaded — /search again to retrieve it)"
     lines = [
         f"📧 {entry.get('subject') or '(no subject)'}",
         "──────────",
@@ -1125,9 +1170,13 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
         emit({"tag": "markdown", "content": meta_md}, len(meta_md))
         body = (e.get("body") or "").strip()
         if not body:
-            body = ("(this email has no text content — probably attachment-only)"
-                    if "body" in e else
-                    "(body not fetched yet — try /scan then /search again)")
+            if "body" in e:
+                body = "(this email has no text content — probably attachment-only)"
+            elif e.get("fetch_missing"):
+                body = ("(this email couldn't be found in the mailbox anymore — "
+                        "it may have been deleted)")
+            else:
+                body = "(content not loaded — /search again to retrieve it)"
         else:
             prev = seen_bodies.get(body)
             if prev is not None:
@@ -1233,7 +1282,10 @@ def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
         reply_text(chat_id, message_id, payload)
         return
     title, entries, total = payload
-    entries = fetch_bodies_live(entries)
+    # Title resolved to Message-ID(s) — now retrieve those emails' contents
+    # live. Every entry in the card gets a fetch attempt (bounded by
+    # SEARCH_MAX_RESULTS), so "every copy" really shows every copy.
+    entries = fetch_contents(entries, limit=len(entries))
     cards = _cards_for_entries(title, entries, total)
     if not reply_card(chat_id, message_id, cards[0]):
         # Card rejected (e.g. missing permission) — plain-text fallback.
@@ -1251,9 +1303,10 @@ def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
 HELP_TEXT = (
     "TObot — email search bot 📮\n"
     "──────────\n"
-    "/search <email title> — find stored emails by title (lists matches + Message-IDs)\n"
+    "/search <email title> — the title finds the email's Message-ID, then the ID\n"
+    "  retrieves that exact email's content live from the mailbox\n"
     "/search <exact full title> — ONE card with every copy of exactly that email\n"
-    "/search <Message-ID> — exact lookup, shows sender + full content\n"
+    "/search <Message-ID> — direct exact lookup (the accurate key)\n"
     "/search <No.> — open result N from your last search listing\n"
     "@TObot <email title> — same as /search (in P2P just type the title)\n"
     "/scan — force a mailbox re-scan now\n"
@@ -1277,8 +1330,7 @@ def _status_text() -> str:
         f"Index updated: {upd}",
         f"Folders: {_folders_label()}",
         f"Last scan: {last.get('when') or '(not yet)'} — "
-        f"{last.get('scanned', 0)} in window, {last.get('new_bodies', 0)} new bodies, "
-        f"{last.get('duration_sec', 0)}s",
+        f"{last.get('scanned', 0)} in window, {last.get('duration_sec', 0)}s",
     ]
     stats = last.get("folders") or {}
     for folder, count in stats.items():
@@ -1297,10 +1349,9 @@ def _status_text() -> str:
 def _do_scan_command(chat_id: str, message_id: str) -> None:
     reply_text(chat_id, message_id, "⏳ Scanning mailbox…")
     try:
-        seen, new_bodies = scan_mailbox()
+        seen = scan_mailbox()
         reply_text(chat_id, message_id,
-                   f"✅ Scan done — {seen} emails in the {WINDOW_DAYS}-day window, "
-                   f"{new_bodies} new bodies fetched.")
+                   f"✅ Scan done — {seen} emails indexed in the {WINDOW_DAYS}-day window.")
     except Exception as ex:
         reply_text(chat_id, message_id, f"❌ Scan failed: {ex!r}")
 
