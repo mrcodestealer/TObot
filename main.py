@@ -1108,15 +1108,7 @@ def _format_details(entry: dict[str, Any]) -> str:
         f"📧 {entry.get('subject') or '(no subject)'}",
         "──────────",
         f"From: {entry.get('from_raw') or ', '.join(entry.get('from') or []) or '?'}",
-    ]
-    if entry.get("to_raw") or entry.get("to"):
-        lines.append(f"To: {entry.get('to_raw') or ', '.join(entry.get('to') or [])}")
-    if entry.get("cc_raw") or entry.get("cc"):
-        lines.append(f"Cc: {entry.get('cc_raw') or ', '.join(entry.get('cc') or [])}")
-    lines += [
         f"Date: {_fmt_date(entry)} ({MAIL_TZ})",
-        f"Folder: {entry.get('folder') or '?'}",
-        f"Message-ID: {entry.get('message_id') or '(none)'}",
         "──────────",
         body,
     ]
@@ -1188,17 +1180,12 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
     for i, e in enumerate(entries, 1):
         if i > 1:
             emit({"tag": "hr"}, 20)
+        # Keep the card lean: just who sent it, when, and the content.
         meta = []
         if n > 1:
             meta.append(f"**#{i}**")
         meta.append(f"**From:** {e.get('from_raw') or ', '.join(e.get('from') or []) or '?'}")
-        if e.get("to_raw") or e.get("to"):
-            meta.append(f"**To:** {e.get('to_raw') or ', '.join(e.get('to') or [])}")
-        if e.get("cc_raw") or e.get("cc"):
-            meta.append(f"**Cc:** {e.get('cc_raw') or ', '.join(e.get('cc') or [])}")
         meta.append(f"**Date:** {_fmt_date(e)} ({MAIL_TZ})")
-        meta.append(f"**Folder:** {e.get('folder') or '?'}")
-        meta.append(f"**Message-ID:** {e.get('message_id') or '(none)'}")
         meta_md = "\n".join(meta)
         emit({"tag": "markdown", "content": meta_md}, len(meta_md))
         body = (e.get("body") or "").strip()
