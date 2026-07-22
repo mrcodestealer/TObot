@@ -28,9 +28,11 @@ Event subscriptions → "Receive events through persistent connection".
 
 from __future__ import annotations
 
+import base64
 import email
 import email.message
 import html as html_lib
+import http
 import imaplib
 import json
 import os
@@ -541,19 +543,91 @@ def _parse_uid_fetch(data: list) -> dict[bytes, bytes]:
     return out
 
 
-def _scan_folder(mail: imaplib.IMAP4, folder: str,
-                 known_keys: set[str], body_budget: list[int]) -> list[dict[str, Any]]:
-    mailbox = _imap_mailbox_name(folder)
+def _imap_list_folder_names(mail: imaplib.IMAP4) -> list[str]:
+    """Actual mailbox names on the server (LIST), for resolving UI labels."""
+    names: list[str] = []
     try:
-        typ, _ = mail.select(mailbox, readonly=True)
+        typ, data = mail.list()
+    except Exception as ex:
+        if _imap_connection_broken(ex):
+            raise ImapStaleConnectionError(f"connection lost during LIST: {ex!r}") from ex
+        print(f"[scan] LIST failed: {ex!r}", flush=True)
+        return names
+    if typ != "OK" or not data:
+        return names
+    for item in data:
+        if not item:
+            continue
+        line = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+        m = re.search(r'"([^"]+)"\s*$', line)
+        if m:
+            names.append(m.group(1))
+        else:
+            parts = line.rsplit(" ", 1)
+            if len(parts) == 2:
+                names.append(parts[1].strip().strip('"'))
+    return names
+
+
+def _match_folder_candidates(want: str, names: list[str]) -> list[str]:
+    """Server folder names that could be the configured label, best match first."""
+    want_cf = (want or "").casefold()
+    want_flat = want_cf.replace(" ", "")
+    out: list[str] = []
+    for name in names:
+        if name.casefold() == want_cf and name not in out:
+            out.append(name)
+    for name in names:
+        if name.casefold().replace(" ", "") == want_flat and name not in out:
+            out.append(name)
+    for name in names:
+        nc = name.casefold()
+        if (want_cf in nc or nc in want_cf) and name not in out:
+            out.append(name)
+    return out
+
+
+_folder_resolve_cache: dict[str, str] = {}
+
+
+def _try_select(mail: imaplib.IMAP4, name: str) -> bool:
+    try:
+        typ, _ = mail.select(_imap_mailbox_name(name), readonly=True)
     except Exception as ex:
         if _imap_connection_broken(ex):
             raise ImapStaleConnectionError(f"connection lost during SELECT: {ex!r}") from ex
-        print(f"[scan] SELECT {folder!r} failed: {ex!r}", flush=True)
-        return []
-    if typ != "OK":
+        print(f"[scan] SELECT {name!r} failed: {ex!r}", flush=True)
+        return False
+    return typ == "OK"
+
+
+def _select_folder_resolved(mail: imaplib.IMAP4, folder: str) -> str:
+    """SELECT the folder, resolving the real mailbox name via LIST if the
+    configured label doesn't match exactly (Lark IMAP folder names can differ
+    from the UI label). Returns the selected name, or '' if nothing worked."""
+    cached = _folder_resolve_cache.get(folder.casefold())
+    for name in ([cached] if cached else []) + [folder]:
+        if _try_select(mail, name):
+            _folder_resolve_cache[folder.casefold()] = name
+            return name
+    names = _imap_list_folder_names(mail)
+    for name in _match_folder_candidates(folder, names):
+        if name != folder and _try_select(mail, name):
+            print(f"[scan] resolved folder {folder!r} -> {name!r}", flush=True)
+            _folder_resolve_cache[folder.casefold()] = name
+            return name
+    if names:
+        print(f"[scan] folder {folder!r} not found; server has: {names}", flush=True)
+    return ""
+
+
+def _scan_folder(mail: imaplib.IMAP4, folder: str,
+                 known_keys: set[str], body_budget: list[int]) -> list[dict[str, Any]]:
+    selected = _select_folder_resolved(mail, folder)
+    if not selected:
         print(f"[scan] SELECT {folder!r} not OK — skipped", flush=True)
         return []
+    folder = selected
     uids = _uid_search(mail, f"(SINCE {_since_date()})")
     if not uids:
         return []
@@ -1047,11 +1121,121 @@ def _on_message(data) -> None:
         print(f"[lark-ws] on_message failed: {ex!r}", flush=True)
 
 
+# The app may be subscribed (in the developer console) to event types this bot
+# never registered — task.task.*, vc.meeting.*, … The stock SDK NACKs those with
+# 500, so Lark redelivers them forever and the journal floods with
+# "handle message failed … processor not found" (same issue osedutybot patched).
+# We ACK 200 and log each distinct unhandled type ONCE. The permanent fix is to
+# unsubscribe those events in the console.
+_ws_unhandled_seen: set[str] = set()
+_ws_unhandled_lock = threading.Lock()
+_WS_UNHANDLED_TYPE_RE = re.compile(r"type:\s*(\S+)")
+
+
+def _ws_unhandled_event_type(exc: Exception) -> Optional[str]:
+    msg = str(exc or "")
+    if "processor not found" not in msg:
+        return None
+    m = _WS_UNHANDLED_TYPE_RE.search(msg)
+    return m.group(1) if m else "<unknown>"
+
+
+def _ws_note_unhandled(event_type: str) -> None:
+    with _ws_unhandled_lock:
+        if event_type in _ws_unhandled_seen:
+            return
+        _ws_unhandled_seen.add(event_type)
+    print(
+        f"[lark-ws] ignoring unsubscribed event type {event_type!r} (ACK 200, "
+        "silenced). Unsubscribe it in the Lark developer console to stop delivery.",
+        flush=True,
+    )
+
+
+def _ws_handler_dispatch(handler, payload: bytes) -> Any:
+    for name in ("_do_without_validation", "do_without_validation"):
+        fn = getattr(handler, name, None)
+        if callable(fn):
+            return fn(payload)
+    raise RuntimeError("lark-oapi EventDispatcherHandler has no dispatch method")
+
+
+def _apply_ws_unhandled_patch() -> None:
+    """Port of osedutybot's ws-client patch: ACK unhandled event types."""
+    from lark_oapi.core.const import UTF_8
+    from lark_oapi.core.json import JSON
+    from lark_oapi.ws.client import Client, _get_by_key
+    from lark_oapi.ws.const import (
+        HEADER_BIZ_RT, HEADER_MESSAGE_ID, HEADER_SEQ, HEADER_SUM,
+        HEADER_TRACE_ID, HEADER_TYPE,
+    )
+    from lark_oapi.ws.enum import MessageType
+    from lark_oapi.ws.model import Response
+
+    if getattr(Client, "_tobot_unhandled_patch", False):
+        return
+
+    async def _handle_data_frame_patched(self, frame):
+        hs = frame.headers
+        msg_id = _get_by_key(hs, HEADER_MESSAGE_ID)
+        trace_id = _get_by_key(hs, HEADER_TRACE_ID)
+        sum_ = _get_by_key(hs, HEADER_SUM)
+        seq = _get_by_key(hs, HEADER_SEQ)
+        type_ = _get_by_key(hs, HEADER_TYPE)
+
+        pl = frame.payload
+        if int(sum_) > 1:
+            pl = self._combine(msg_id, int(sum_), int(seq), pl)
+            if pl is None:
+                return
+
+        message_type = MessageType(type_)
+        resp = Response(code=http.HTTPStatus.OK)
+        try:
+            start = int(round(time.time() * 1000))
+            if message_type in (MessageType.EVENT, MessageType.CARD):
+                result = _ws_handler_dispatch(self._event_handler, pl)
+            else:
+                return
+            end = int(round(time.time() * 1000))
+            header = hs.add()
+            header.key = HEADER_BIZ_RT
+            header.value = str(end - start)
+            if result is not None:
+                resp.data = base64.b64encode(JSON.marshal(result).encode(UTF_8))
+        except Exception as e:
+            unhandled = _ws_unhandled_event_type(e)
+            if unhandled is not None:
+                _ws_note_unhandled(unhandled)
+            else:
+                from lark_oapi.core.log import logger
+
+                logger.error(
+                    self._fmt_log(
+                        "handle message failed, message_type: {}, message_id: {}, trace_id: {}, err: {}",
+                        message_type.value, msg_id, trace_id, e,
+                    )
+                )
+                resp = Response(code=http.HTTPStatus.INTERNAL_SERVER_ERROR)
+
+        frame.payload = JSON.marshal(resp).encode(UTF_8)
+        await self._write_message(frame.SerializeToString())
+
+    Client._handle_data_frame = _handle_data_frame_patched
+    Client._tobot_unhandled_patch = True
+    print("[lark-ws] patched ws client: unhandled event types are ACKed silently", flush=True)
+
+
 def run_ws_forever() -> None:
     import lark_oapi as lark
 
     if not (APP_ID and APP_SECRET):
         raise RuntimeError("Set APP_ID and APP_SECRET in .env")
+    try:
+        _apply_ws_unhandled_patch()
+    except Exception as ex:
+        print(f"[lark-ws] unhandled-event patch not applied ({ex!r}) — "
+              "SDK will log unsubscribed events noisily", flush=True)
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_on_message)
