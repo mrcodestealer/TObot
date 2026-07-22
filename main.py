@@ -1094,7 +1094,7 @@ def _search_entries(
 
 
 def _format_details(entry: dict[str, Any]) -> str:
-    body = (entry.get("body") or "").strip()
+    body = _display_body(entry)
     if len(body) > BODY_SHOW_MAX_CHARS:
         body = body[:BODY_SHOW_MAX_CHARS].rstrip() + "\n… (trimmed)"
     if not body:
@@ -1136,6 +1136,54 @@ def _entry_by_key(key: str) -> Optional[dict[str, Any]]:
             if entry_key(e) == key:
                 return e
     return None
+
+
+# Markers that start quoted history inside a reply body (top-posting): quoted
+# ">" lines, "On … wrote:", Outlook "-----Original Message-----" / underscore
+# dividers, and embedded "From:" header blocks of the quoted mail.
+_QUOTE_LINE_RE = re.compile(r"^\s*[>＞]")
+_QUOTE_CUT_RES = [
+    re.compile(r"^\s*-{2,}\s*(Original|Forwarded) Message\s*-{2,}", re.I),
+    re.compile(r"^\s*_{10,}\s*$"),
+    re.compile(r"^\s*On .{4,160} wrote:\s*$", re.I),
+    re.compile(r"^\s*在.{2,120}写道[:：]\s*$"),
+    re.compile(r"^\s*发件人[:：]"),
+    re.compile(r"^\s*From:\s*\S", re.I),
+]
+HIDE_QUOTED_HISTORY = _env("TOBOT_HIDE_QUOTES", default="1").lower() not in (
+    "0", "false", "no", "off",
+)
+
+
+def strip_quoted_history(text: str) -> str:
+    """Drop the quoted previous-messages tail of a reply, keeping the new part.
+
+    Returns "" when the body is nothing but quoted history.
+    """
+    lines = (text or "").splitlines()
+    cut = len(lines)
+    for i, ln in enumerate(lines):
+        if _QUOTE_LINE_RE.match(ln) or any(rx.match(ln) for rx in _QUOTE_CUT_RES):
+            cut = i
+            break
+    head = lines[:cut]
+    # Drop a dangling attribution line ("On …," / "…:") left right above the quote.
+    while head and re.search(r"(wrote:|写道[:：]|[:：])\s*$", head[-1].strip()) and cut < len(lines):
+        head.pop()
+    return "\n".join(head).strip()
+
+
+def _display_body(e: dict[str, Any]) -> str:
+    """The body as shown in cards/fallback: quoted history hidden (config-gated)."""
+    body = (e.get("body") or "").strip()
+    if not body or not HIDE_QUOTED_HISTORY:
+        return body
+    stripped = strip_quoted_history(body)
+    if stripped == body:
+        return body
+    if stripped:
+        return stripped + "\n\n… (quoted earlier messages hidden)"
+    return "(this email only quoted earlier messages — see the previous emails in this thread)"
 
 
 def _split_body(body: str, budget: int) -> list[str]:
@@ -1188,7 +1236,7 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
         meta.append(f"**Date:** {_fmt_date(e)} ({MAIL_TZ})")
         meta_md = "\n".join(meta)
         emit({"tag": "markdown", "content": meta_md}, len(meta_md))
-        body = (e.get("body") or "").strip()
+        body = _display_body(e)
         if not body:
             if "body" in e:
                 body = "(this email has no text content — probably attachment-only)"
