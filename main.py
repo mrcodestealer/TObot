@@ -166,24 +166,23 @@ def get_tenant_access_token() -> str:
     return token
 
 
-def reply_text(chat_id: str, message_id: str, text: str) -> None:
+def _reply(chat_id: str, message_id: str, msg_type: str, content: str) -> bool:
     """Quote-reply to the inbound message; falls back to a plain chat send."""
     token = get_tenant_access_token()
     if not token:
-        return
+        return False
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    content = json.dumps({"text": text}, ensure_ascii=False)
     mid = (message_id or "").strip()
     if mid:
         try:
             r = requests.post(
                 f"https://open.larksuite.com/open-apis/im/v1/messages/{mid}/reply",
                 headers=headers,
-                json={"msg_type": "text", "content": content},
+                json={"msg_type": msg_type, "content": content},
                 timeout=20,
             ).json()
             if r.get("code") == 0:
-                return
+                return True
             print(f"[lark] reply failed ({r.get('code')}: {r.get('msg')}) — fallback to send", flush=True)
         except Exception as ex:
             print(f"[lark] reply failed: {ex!r} — fallback to send", flush=True)
@@ -192,13 +191,23 @@ def reply_text(chat_id: str, message_id: str, text: str) -> None:
             "https://open.larksuite.com/open-apis/im/v1/messages",
             headers=headers,
             params={"receive_id_type": "chat_id"},
-            json={"receive_id": chat_id, "msg_type": "text", "content": content},
+            json={"receive_id": chat_id, "msg_type": msg_type, "content": content},
             timeout=20,
         ).json()
-        if r.get("code") != 0:
-            print(f"[lark] send failed: {r}", flush=True)
+        if r.get("code") == 0:
+            return True
+        print(f"[lark] send failed: {r}", flush=True)
     except Exception as ex:
         print(f"[lark] send failed: {ex!r}", flush=True)
+    return False
+
+
+def reply_text(chat_id: str, message_id: str, text: str) -> bool:
+    return _reply(chat_id, message_id, "text", json.dumps({"text": text}, ensure_ascii=False))
+
+
+def reply_card(chat_id: str, message_id: str, card: dict) -> bool:
+    return _reply(chat_id, message_id, "interactive", json.dumps(card, ensure_ascii=False))
 
 
 # ===================== Message reactions (GotIt → Done ack) =====================
@@ -859,8 +868,10 @@ def _fmt_date(entry: dict[str, Any]) -> str:
 
 
 def _score_subject(subject: str, query: str) -> int:
-    s = (subject or "").casefold().strip()
-    q = (query or "").casefold().strip()
+    # Whitespace-normalized so pasted titles (line wraps, collapsed double
+    # spaces) still count as an exact match.
+    s = re.sub(r"\s+", " ", (subject or "").casefold().strip())
+    q = re.sub(r"\s+", " ", (query or "").casefold().strip())
     if not s or not q:
         return 0
     if s == q:
@@ -882,33 +893,44 @@ def _score_subject(subject: str, query: str) -> int:
     return int(45 * partial / len(q_tokens))
 
 
-def _search_entries(query: str) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
-    """(exact_message_id_hit, scored subject matches newest-first)."""
+def _search_entries(
+    query: str,
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]], bool, int]:
+    """(exact_message_id_hit, matches newest-first, exact_title, total_matches).
+
+    When the query equals a subject exactly (whitespace-normalized), ONLY the
+    copies of that exact title are returned — similar-but-different titles are
+    dropped so "search that email only" really means that email.
+    """
     with _store_lock:
         emails = list(_load_index().get("emails", []))
     qmid = _normalize_mid(query)
     if qmid:
         for e in reversed(emails):  # newest copy wins
             if _normalize_mid(e.get("message_id")) == qmid:
-                return e, []
+                return e, [], False, 1
     scored: list[tuple[int, float, dict[str, Any]]] = []
     for e in emails:
         sc = _score_subject(e.get("subject") or "", query)
         if sc >= 30:
             scored.append((sc, float(e.get("date_ts") or 0.0), e))
     scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    exact_title = bool(scored) and scored[0][0] == 100
+    if exact_title:
+        scored = [t for t in scored if t[0] == 100]
     # Dedup by key (same Message-ID seen in several folders).
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
+    total = 0
     for _sc, _ts, e in scored:
         k = entry_key(e)
         if k in seen:
             continue
         seen.add(k)
-        out.append(e)
-        if len(out) >= SEARCH_MAX_RESULTS:
-            break
-    return None, out
+        total += 1
+        if len(out) < SEARCH_MAX_RESULTS:
+            out.append(e)
+    return None, out, exact_title, total
 
 
 def _format_details(entry: dict[str, Any]) -> str:
@@ -962,13 +984,65 @@ def _entry_by_key(key: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def handle_search(chat_id: str, query: str) -> str:
+def _card_for_entries(title: str, entries: list[dict[str, Any]],
+                      total: Optional[int] = None) -> dict[str, Any]:
+    """Lark interactive card: one section per email copy, identical bodies deduped."""
+    n = len(entries)
+    per = max(400, min(BODY_SHOW_MAX_CHARS, 24000 // max(1, n)))
+    elements: list[dict[str, Any]] = []
+    if total and total > n:
+        elements.append({
+            "tag": "markdown",
+            "content": f"*(showing the newest {n} of {total} emails with this title)*",
+        })
+    seen_bodies: dict[str, int] = {}
+    for i, e in enumerate(entries, 1):
+        if i > 1:
+            elements.append({"tag": "hr"})
+        meta = []
+        if n > 1:
+            meta.append(f"**#{i}**")
+        meta.append(f"**From:** {e.get('from_raw') or ', '.join(e.get('from') or []) or '?'}")
+        if e.get("to_raw") or e.get("to"):
+            meta.append(f"**To:** {e.get('to_raw') or ', '.join(e.get('to') or [])}")
+        if e.get("cc_raw") or e.get("cc"):
+            meta.append(f"**Cc:** {e.get('cc_raw') or ', '.join(e.get('cc') or [])}")
+        meta.append(f"**Date:** {_fmt_date(e)} ({MAIL_TZ})")
+        meta.append(f"**Folder:** {e.get('folder') or '?'}")
+        meta.append(f"**Message-ID:** {e.get('message_id') or '(none)'}")
+        elements.append({"tag": "markdown", "content": "\n".join(meta)})
+        body = (e.get("body") or "").strip()
+        if not body:
+            body = ("(this email has no text content — probably attachment-only)"
+                    if "body" in e else
+                    "(body not fetched yet — try /scan then /search again)")
+        else:
+            prev = seen_bodies.get(body)
+            if prev is not None:
+                body = f"(same content as #{prev})"
+            else:
+                seen_bodies[body] = i
+                if len(body) > per:
+                    body = body[:per].rstrip() + "\n… (trimmed)"
+        elements.append({"tag": "markdown", "content": body})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"📧 {title}"[:150]},
+            "template": "blue",
+        },
+        "elements": elements,
+    }
+
+
+def handle_search(chat_id: str, query: str) -> tuple[str, Any]:
+    """('text', message) or ('card', (title, entries, total)) for a search query."""
     query = (query or "").strip()
     usage = ("Usage: /search <email title or Message-ID>\n"
              "Example: /search Evolution maintenance\n"
              "Example: /search <abc123@larksuite.com>")
     if not query:
-        return usage
+        return "text", usage
 
     # Quoted query = always a title search (escape hatch for numeric titles).
     force_title = False
@@ -976,7 +1050,7 @@ def handle_search(chat_id: str, query: str) -> str:
         query = query[1:-1].strip("”").strip()
         force_title = True
         if not query:
-            return usage
+            return "text", usage
 
     # Numeric pick from this chat's previous listing.
     note = ""
@@ -987,16 +1061,17 @@ def handle_search(chat_id: str, query: str) -> str:
         if 1 <= n <= len(keys):
             entry = _entry_by_key(keys[n - 1])
             if entry:
-                return _format_details(entry)
-            return f"Result {n} is no longer in the index — /search it again."
+                return "card", (entry.get("subject") or "(no subject)", [entry], 1)
+            return "text", f"Result {n} is no longer in the index — /search it again."
         if keys:
-            return (f"Pick 1–{len(keys)} from your last search, or /search a new title.\n"
-                    f'To search “{query}” as a title instead, quote it: /search "{query}"')
+            return "text", (
+                f"Pick 1–{len(keys)} from your last search, or /search a new title.\n"
+                f'To search “{query}” as a title instead, quote it: /search "{query}"')
         note = f"(no previous listing in this chat — searching “{query}” as a title)\n\n"
 
-    exact, results = _search_entries(query)
+    exact, results, exact_title, total = _search_entries(query)
     if exact:
-        return _format_details(exact)
+        return "card", (exact.get("subject") or "(no subject)", [exact], 1)
     if not results:
         with _store_lock:
             idx_count = len(_load_index().get("emails", []))
@@ -1005,15 +1080,35 @@ def handle_search(chat_id: str, query: str) -> str:
                    "still be running (the bot just started)")
             if _last_scan_info.get("error"):
                 msg += f", and the last scan failed: {_last_scan_info['error']}"
-            return msg + ".\nCheck /status, or force a scan with /scan."
-        return (note + f"No email found for “{query}” in the last {WINDOW_DAYS} days.\n"
-                "Tips: try fewer words from the title, or paste the exact Message-ID.\n"
-                "A /scan forces a fresh mailbox re-scan.")
+            return "text", msg + ".\nCheck /status, or force a scan with /scan."
+        return "text", (
+            note + f"No email found for “{query}” in the last {WINDOW_DAYS} days.\n"
+            "Tips: try fewer words from the title, or paste the exact Message-ID.\n"
+            "A /scan forces a fresh mailbox re-scan.")
+    if exact_title:
+        # Exact title match: ONE card with every copy of exactly this email.
+        with _last_results_lock:
+            _last_results[chat_id] = [entry_key(e) for e in results]
+        return "card", (results[0].get("subject") or query, results, total)
     if len(results) == 1:
-        return note + _format_details(results[0])
+        return "card", (results[0].get("subject") or "(no subject)", results, 1)
     with _last_results_lock:
         _last_results[chat_id] = [entry_key(e) for e in results]
-    return note + _format_listing(query, results)
+    return "text", note + _format_listing(query, results)
+
+
+def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
+    kind, payload = handle_search(chat_id, query)
+    if kind == "text":
+        reply_text(chat_id, message_id, payload)
+        return
+    title, entries, total = payload
+    if reply_card(chat_id, message_id, _card_for_entries(title, entries, total)):
+        return
+    # Card rejected (e.g. missing permission) — plain-text fallback.
+    note = f"(+{len(entries) - 1} more copies of this title — card view failed)\n\n" \
+        if len(entries) > 1 else ""
+    reply_text(chat_id, message_id, note + _format_details(entries[0]))
 
 
 # ===================== Command router =====================
@@ -1021,6 +1116,7 @@ HELP_TEXT = (
     "TObot — email search bot 📮\n"
     "──────────\n"
     "/search <email title> — find stored emails by title (lists matches + Message-IDs)\n"
+    "/search <exact full title> — ONE card with every copy of exactly that email\n"
     "/search <Message-ID> — exact lookup, shows sender + full content\n"
     "/search <No.> — open result N from your last search listing\n"
     "@TObot <email title> — same as /search (in P2P just type the title)\n"
@@ -1087,7 +1183,7 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
     low = t.lower()
     action = None
     if low.startswith("/search"):
-        action = lambda: reply_text(chat_id, message_id, handle_search(chat_id, t[len("/search"):]))
+        action = lambda: _search_and_reply(chat_id, message_id, t[len("/search"):])
     elif low.startswith("/scan"):
         action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):
@@ -1099,7 +1195,7 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
             action = lambda: reply_text(chat_id, message_id, HELP_TEXT)
         elif not low.startswith("/"):
             # Tagged (or P2P) plain text = search query.
-            action = lambda: reply_text(chat_id, message_id, handle_search(chat_id, t))
+            action = lambda: _search_and_reply(chat_id, message_id, t)
     if action is None:
         return
     gotit_id = add_reaction(message_id, _GOTIT_EMOJIS)
