@@ -81,7 +81,7 @@ MAIL_TZ = _env("TOBOT_TZ", "MAINTENANCE_MAIL_TZ", default="Asia/Manila")
 
 # ===================== Index tuning =====================
 STORE_PATH = os.path.join(_ROOT, "allemail.json")
-WINDOW_DAYS = min(365, max(1, int(_env("TOBOT_WINDOW_DAYS", default="30"))))
+WINDOW_DAYS = min(365, max(1, int(_env("TOBOT_WINDOW_DAYS", default="180"))))
 SCAN_INTERVAL_SEC = max(60, int(_env("TOBOT_SCAN_INTERVAL_SEC", default="300")))
 SCAN_CAP_PER_FOLDER = min(20000, max(50, int(_env("TOBOT_SCAN_CAP_PER_FOLDER", default="3000"))))
 BODY_FETCH_CAP_PER_SCAN = max(20, int(_env("TOBOT_BODY_FETCH_CAP", default="500")))
@@ -113,7 +113,10 @@ IMAP_FOLDERS = _default_folders()
 
 _store_lock = threading.Lock()
 _scan_lock = threading.Lock()
-_last_scan_info: dict[str, Any] = {"when": "", "scanned": 0, "new_bodies": 0, "error": ""}
+_last_scan_info: dict[str, Any] = {
+    "when": "", "scanned": 0, "new_bodies": 0, "error": "",
+    "folders": {}, "duration_sec": 0,
+}
 
 
 # ===================== Lark send helpers =====================
@@ -179,6 +182,52 @@ def reply_text(chat_id: str, message_id: str, text: str) -> None:
             print(f"[lark] send failed: {r}", flush=True)
     except Exception as ex:
         print(f"[lark] send failed: {ex!r}", flush=True)
+
+
+# ===================== Message reactions (GotIt → Done ack) =====================
+# Lark UI tooltip says "GotIt" but the official emoji_type is "Get"
+# (same fallback chains osedutybot uses).
+_GOTIT_EMOJIS = ("Get", "GotIt", "GOTIT", "LGTM", "OnIt", "CheckMark")
+_DONE_EMOJIS = ("DONE", "Done", "CheckMark", "JIAYI")
+
+
+def add_reaction(message_id: str, candidates: tuple[str, ...]) -> str:
+    """Add the first accepted emoji reaction; returns its reaction_id ('' on failure)."""
+    mid = (message_id or "").strip()
+    token = get_tenant_access_token()
+    if not (mid and token):
+        return ""
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    for emoji in candidates:
+        try:
+            r = requests.post(
+                f"https://open.larksuite.com/open-apis/im/v1/messages/{mid}/reactions",
+                headers=headers,
+                json={"reaction_type": {"emoji_type": emoji}},
+                timeout=10,
+            ).json()
+        except Exception as ex:
+            print(f"[lark] reaction {emoji} failed: {ex!r}", flush=True)
+            continue
+        if r.get("code") == 0:
+            return str((r.get("data") or {}).get("reaction_id") or "")
+        print(f"[lark] reaction {emoji} rejected: {r.get('code')} {r.get('msg')}", flush=True)
+    return ""
+
+
+def remove_reaction(message_id: str, reaction_id: str) -> None:
+    mid, rid = (message_id or "").strip(), (reaction_id or "").strip()
+    token = get_tenant_access_token()
+    if not (mid and rid and token):
+        return
+    try:
+        requests.delete(
+            f"https://open.larksuite.com/open-apis/im/v1/messages/{mid}/reactions/{rid}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+    except Exception as ex:
+        print(f"[lark] remove reaction failed: {ex!r}", flush=True)
 
 
 # ===================== Email parsing =====================
@@ -447,16 +496,48 @@ def _uid_search(mail: imaplib.IMAP4, criteria: str) -> list[bytes]:
 
 
 def _parse_uid_fetch(data: list) -> dict[bytes, bytes]:
-    """FETCH response → {uid: raw_bytes} (works for header-only and full fetches)."""
+    """FETCH response → {uid: raw_bytes} (headers or full messages).
+
+    Port of osedutybot's ``_parse_uid_header_fetch_data``: the Lark IMAP server
+    can echo ``UID`` BEFORE the literal (in the tuple meta) or AFTER it (in the
+    trailing bytes element right after the tuple) — handle both, plus inline
+    non-literal responses.
+    """
     out: dict[bytes, bytes] = {}
-    for item in data or []:
-        if not isinstance(item, tuple) or len(item) < 2:
+    i = 0
+    while i < len(data or []):
+        item = data[i]
+        if isinstance(item, tuple) and len(item) >= 2:
+            meta, payload = item[0], item[1]
+            if isinstance(meta, bytes) and isinstance(payload, bytes):
+                uid_b: Optional[bytes] = None
+                m = re.search(rb"UID (\d+)", meta)
+                if m:
+                    uid_b = m.group(1)
+                elif i + 1 < len(data) and isinstance(data[i + 1], bytes):
+                    m2 = re.search(rb"UID (\d+)", data[i + 1])
+                    if m2:
+                        uid_b = m2.group(1)
+                        i += 1
+                if uid_b:
+                    out[uid_b] = payload
+            i += 1
             continue
-        meta = item[0] if isinstance(item[0], bytes) else b""
-        m = re.search(rb"UID (\d+)", meta)
-        if not m:
-            continue
-        out[m.group(1)] = item[1] or b""
+        if isinstance(item, bytes):
+            m = re.match(rb"(\d+) \(UID (\d+)", item)
+            if m:
+                uid_b = m.group(2)
+                i += 1
+                hdr = b""
+                if i < len(data) and isinstance(data[i], bytes):
+                    nxt = data[i]
+                    if not nxt.startswith(b")") and not re.match(rb"\d+ \(UID ", nxt):
+                        hdr = nxt
+                        i += 1
+                if hdr:
+                    out[uid_b] = hdr
+                continue
+        i += 1
     return out
 
 
@@ -563,19 +644,25 @@ def scan_mailbox() -> tuple[int, int]:
             }
         body_budget = [BODY_FETCH_CAP_PER_SCAN]
         all_entries: list[dict[str, Any]] = []
+        folder_stats: dict[str, Any] = {}
+        started = time.monotonic()
         mail = _connect_imap()
         try:
             for folder in IMAP_FOLDERS:
                 try:
-                    all_entries.extend(_scan_folder(mail, folder, known_keys, body_budget))
+                    got = _scan_folder(mail, folder, known_keys, body_budget)
+                    all_entries.extend(got)
+                    folder_stats[folder] = len(got)
                 except ImapStaleConnectionError as ex:
                     # Dead/hung socket: every further op would block IMAP_TIMEOUT
                     # while holding _scan_lock — abort, keep what we got,
                     # reconnect fresh next cycle.
                     print(f"[scan] {ex} — aborting scan after {folder!r}", flush=True)
+                    folder_stats[folder] = "connection lost"
                     break
                 except Exception as ex:
                     print(f"[scan] folder {folder!r} failed: {ex!r}", flush=True)
+                    folder_stats[folder] = f"failed: {ex!r}"
         finally:
             try:
                 mail.logout()
@@ -588,6 +675,8 @@ def scan_mailbox() -> tuple[int, int]:
             "scanned": len(all_entries),
             "new_bodies": new_bodies,
             "error": "",
+            "folders": folder_stats,
+            "duration_sec": int(time.monotonic() - started),
         })
         return len(all_entries), new_bodies
 
@@ -787,6 +876,7 @@ HELP_TEXT = (
     "/search <email title> — find stored emails by title (lists matches + Message-IDs)\n"
     "/search <Message-ID> — exact lookup, shows sender + full content\n"
     "/search <No.> — open result N from your last search listing\n"
+    "@TObot <email title> — same as /search (in P2P just type the title)\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -806,36 +896,71 @@ def _status_text() -> str:
         "TObot status 📮",
         f"Indexed emails: {n} (window {WINDOW_DAYS}d, cap {MAX_ENTRIES})",
         f"Index updated: {upd}",
-        f"Folders: {', '.join(IMAP_FOLDERS)}",
         f"Last scan: {last.get('when') or '(not yet)'} — "
-        f"{last.get('scanned', 0)} in window, {last.get('new_bodies', 0)} new bodies",
+        f"{last.get('scanned', 0)} in window, {last.get('new_bodies', 0)} new bodies, "
+        f"{last.get('duration_sec', 0)}s",
     ]
+    stats = last.get("folders") or {}
+    for folder in IMAP_FOLDERS:
+        lines.append(f"  {folder}: {stats.get(folder, '(not scanned)')}")
     if last.get("error"):
         lines.append(f"Last scan error: {last['error']}")
     return "\n".join(lines)
 
 
-def handle_command(text: str, chat_id: str, message_id: str) -> None:
+def _do_scan_command(chat_id: str, message_id: str) -> None:
+    reply_text(chat_id, message_id, "⏳ Scanning mailbox…")
+    try:
+        seen, new_bodies = scan_mailbox()
+        reply_text(chat_id, message_id,
+                   f"✅ Scan done — {seen} emails in the {WINDOW_DAYS}-day window, "
+                   f"{new_bodies} new bodies fetched.")
+    except Exception as ex:
+        reply_text(chat_id, message_id, f"❌ Scan failed: {ex!r}")
+
+
+def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -> None:
+    """Pick the action for a message; ack with GotIt while working, Done after.
+
+    ``directed`` = P2P chat or the bot was @-mentioned. Undirected group chatter
+    only triggers on TObot's own slash commands, and unknown /commands stay
+    silent (other bots share these groups) — so reactions never fire on
+    messages we don't answer.
+    """
     t = (text or "").strip()
     if not t:
         return
     low = t.lower()
+    action = None
     if low.startswith("/search"):
-        reply_text(chat_id, message_id, handle_search(chat_id, t[len("/search"):]))
+        action = lambda: reply_text(chat_id, message_id, handle_search(chat_id, t[len("/search"):]))
     elif low.startswith("/scan"):
-        reply_text(chat_id, message_id, "⏳ Scanning mailbox…")
-        try:
-            seen, new_bodies = scan_mailbox()
-            reply_text(chat_id, message_id,
-                       f"✅ Scan done — {seen} emails in the {WINDOW_DAYS}-day window, "
-                       f"{new_bodies} new bodies fetched.")
-        except Exception as ex:
-            reply_text(chat_id, message_id, f"❌ Scan failed: {ex!r}")
+        action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):
-        reply_text(chat_id, message_id, _status_text())
-    elif low.startswith("/help") or low in ("help", "hi", "hello"):
-        reply_text(chat_id, message_id, HELP_TEXT)
-    # anything else: stay silent (bot may sit in busy groups)
+        action = lambda: reply_text(chat_id, message_id, _status_text())
+    elif low.startswith("/help"):
+        action = lambda: reply_text(chat_id, message_id, HELP_TEXT)
+    elif directed:
+        if low in ("help", "hi", "hello"):
+            action = lambda: reply_text(chat_id, message_id, HELP_TEXT)
+        elif not low.startswith("/"):
+            # Tagged (or P2P) plain text = search query.
+            action = lambda: reply_text(chat_id, message_id, handle_search(chat_id, t))
+    if action is None:
+        return
+    gotit_id = add_reaction(message_id, _GOTIT_EMOJIS)
+    try:
+        action()
+    except Exception as ex:
+        print(f"[tobot] command failed: {ex!r}", flush=True)
+        try:
+            reply_text(chat_id, message_id, f"❌ Something went wrong: {ex!r}")
+        except Exception:
+            pass
+    finally:
+        if gotit_id:
+            remove_reaction(message_id, gotit_id)
+        add_reaction(message_id, _DONE_EMOJIS)
 
 
 # ===================== Lark persistent connection =====================
@@ -856,6 +981,45 @@ def _already_handled(message_id: str) -> bool:
 
 
 _MENTION_RE = re.compile(r"@_user_\d+\s*")
+_bot_open_id_lock = threading.Lock()
+_bot_open_id_cache = ""
+
+
+def _bot_open_id() -> str:
+    """This bot's own open_id (GET /bot/v3/info), cached after first success."""
+    global _bot_open_id_cache
+    with _bot_open_id_lock:
+        if _bot_open_id_cache:
+            return _bot_open_id_cache
+        token = get_tenant_access_token()
+        if not token:
+            return ""
+        try:
+            r = requests.get(
+                "https://open.larksuite.com/open-apis/bot/v3/info",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10,
+            ).json()
+            oid = str(((r.get("bot") or (r.get("data") or {}).get("bot") or {})
+                       ).get("open_id") or "")
+            if oid:
+                _bot_open_id_cache = oid
+        except Exception as ex:
+            print(f"[lark] bot info failed: {ex!r}", flush=True)
+        return _bot_open_id_cache
+
+
+def _bot_mentioned(msg) -> bool:
+    mentions = getattr(msg, "mentions", None) or []
+    if not mentions:
+        return False
+    bot_oid = _bot_open_id()
+    for m in mentions:
+        oid = getattr(getattr(m, "id", None), "open_id", "") or ""
+        if bot_oid and oid == bot_oid:
+            return True
+    # Bot id unknown (info call failed): treat any mention as directed.
+    return not bot_oid
 
 
 def _on_message(data) -> None:
@@ -867,6 +1031,7 @@ def _on_message(data) -> None:
         if (getattr(msg, "message_type", "") or "") != "text":
             return
         chat_id = getattr(msg, "chat_id", "") or ""
+        chat_type = (getattr(msg, "chat_type", "") or "").lower()
         try:
             content = json.loads(getattr(msg, "content", "") or "{}")
         except (ValueError, TypeError):
@@ -874,8 +1039,9 @@ def _on_message(data) -> None:
         text = _MENTION_RE.sub("", str(content.get("text") or "")).strip()
         if not text:
             return
+        directed = chat_type == "p2p" or _bot_mentioned(msg)
         threading.Thread(
-            target=handle_command, args=(text, chat_id, message_id), daemon=True
+            target=_process_message, args=(text, chat_id, message_id, directed), daemon=True
         ).start()
     except Exception as ex:
         print(f"[lark-ws] on_message failed: {ex!r}", flush=True)

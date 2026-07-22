@@ -11,9 +11,14 @@ Lark chat.
 | `/search <email title>` | Fuzzy search by subject — lists matches with their Message-IDs |
 | `/search <Message-ID>` | Exact lookup (most accurate) — shows sender, To/Cc, date, folder and content |
 | `/search <No.>` | Open result N from your previous `/search` listing |
+| `@TObot <email title>` | Same as `/search` (in P2P chat just type the title) |
 | `/scan` | Force an immediate mailbox re-scan |
-| `/status` | Index size, retention window, last scan |
+| `/status` | Index size, retention window, last scan (per folder) |
 | `/help` | Help |
+
+While TObot processes your message it reacts with **GotIt** 👌 on it, then swaps
+to **Done** ✅ when the reply is sent (needs the *message reactions* permission
+in the Lark developer console).
 
 Typical flow: `/search evolution maintenance` → pick from the listing →
 `/search 2` (or paste the Message-ID for the exact email).
@@ -22,7 +27,7 @@ Typical flow: `/search evolution maintenance` → pick from the listing →
 
 - A background thread logs into IMAP (`imap.larksuite.com`) every
   `TOBOT_SCAN_INTERVAL_SEC` (default 5 min), lists everything in
-  `TOBOT_IMAP_FOLDERS` from the last `TOBOT_WINDOW_DAYS` (default 30) days,
+  `TOBOT_IMAP_FOLDERS` from the last `TOBOT_WINDOW_DAYS` (default 180) days,
   and stores subject / Message-ID / From / To / Cc / date / folder / body
   into `allemail.json` (atomic writes, deduped by Message-ID).
 - Bodies are fetched **only for new emails** (bounded per scan), so scans stay cheap.
