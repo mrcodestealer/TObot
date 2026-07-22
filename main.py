@@ -1182,7 +1182,7 @@ def _display_body(e: dict[str, Any]) -> str:
     if stripped == body:
         return body
     if stripped:
-        return stripped + "\n\n… (quoted earlier messages hidden)"
+        return stripped
     return "(this email only quoted earlier messages — see the previous emails in this thread)"
 
 
