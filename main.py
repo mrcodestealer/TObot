@@ -834,6 +834,62 @@ def scan_mailbox() -> tuple[int, int]:
         return len(all_entries), new_bodies
 
 
+def fetch_bodies_live(entries: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    """On-demand body fetch for entries the backfill hasn't reached yet.
+
+    Called from the /search path right before showing a card, so the user sees
+    the content immediately instead of "(body not fetched yet)". Fetched bodies
+    are merged into the index. Best-effort: any failure keeps the original entry.
+    """
+    need = [e for e in entries if "body" not in e and e.get("uid") and e.get("folder")]
+    if not need:
+        return entries
+    updated: dict[str, dict[str, Any]] = {}
+    try:
+        mail = _connect_imap()
+    except Exception as ex:
+        print(f"[live-fetch] connect failed: {ex!r}", flush=True)
+        return entries
+    try:
+        by_folder: dict[str, list[dict[str, Any]]] = {}
+        for e in need[:limit]:
+            by_folder.setdefault(e["folder"], []).append(e)
+        for folder, ents in by_folder.items():
+            selected = _select_folder_resolved(mail, folder)
+            if not selected:
+                continue
+            uid_str = ",".join(str(e["uid"]) for e in ents)
+            try:
+                typ, data = mail.uid("fetch", uid_str, "(BODY.PEEK[])")
+            except Exception as ex:
+                print(f"[live-fetch] fetch failed in {folder!r}: {ex!r}", flush=True)
+                continue
+            if typ != "OK" or not data:
+                continue
+            for uid_b, raw in _parse_uid_fetch(data).items():
+                try:
+                    msg = email.message_from_bytes(raw)
+                    ne = message_to_entry(
+                        msg, folder=_imap_utf7_decode(selected),
+                        uid=uid_b.decode(errors="replace"), with_body=True,
+                    )
+                    updated[entry_key(ne)] = ne
+                except Exception:
+                    continue
+    except ImapStaleConnectionError as ex:
+        print(f"[live-fetch] {ex}", flush=True)
+    finally:
+        try:
+            mail.logout()
+        except Exception:
+            pass
+    if not updated:
+        return entries
+    _merge_and_save(list(updated.values()))
+    print(f"[live-fetch] fetched {len(updated)} body(ies) on demand", flush=True)
+    return [updated.get(entry_key(e), e) for e in entries]
+
+
 def _scanner_daemon() -> None:
     print("[scan] first scan of a fresh index backfills the whole "
           f"{WINDOW_DAYS}-day window — this can take several minutes", flush=True)
@@ -1083,6 +1139,9 @@ def handle_search(chat_id: str, query: str) -> tuple[str, Any]:
             return "text", msg + ".\nCheck /status, or force a scan with /scan."
         return "text", (
             note + f"No email found for “{query}” in the last {WINDOW_DAYS} days.\n"
+            f"Note: only these folders are indexed — {_folders_label()}. "
+            "If the email lives elsewhere (e.g. the parent OSE Pending folder or "
+            "CLOSED EMAILS), add that folder to TOBOT_IMAP_FOLDERS in .env.\n"
             "Tips: try fewer words from the title, or paste the exact Message-ID.\n"
             "A /scan forces a fresh mailbox re-scan.")
     if exact_title:
@@ -1103,6 +1162,7 @@ def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
         reply_text(chat_id, message_id, payload)
         return
     title, entries, total = payload
+    entries = fetch_bodies_live(entries)
     if reply_card(chat_id, message_id, _card_for_entries(title, entries, total)):
         return
     # Card rejected (e.g. missing permission) — plain-text fallback.
