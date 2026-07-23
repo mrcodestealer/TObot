@@ -385,21 +385,43 @@ _IMG_PLACEHOLDER_RE = re.compile(r"\[\s*(?:image|cid)\b[^\]]*\]", re.I)
 _DATA_URI_RE = re.compile(r"data:image/(png|jpe?g|gif|webp|bmp);base64,([A-Za-z0-9+/=\s]+)", re.I)
 
 
+# Untrusted email: bound how many image parts we ever decode into memory, and
+# skip any single part whose ENCODED size already exceeds the max (so a 50 MB
+# inline image is never base64-decoded just to be thrown away by the filter).
+_MAX_IMAGE_PARTS_SCANNED = 40
+
+
+def _encoded_len(part: email.message.Message) -> int:
+    try:
+        payload = part.get_payload(decode=False)
+        return len(payload) if isinstance(payload, str) else 0
+    except Exception:
+        return 0
+
+
 def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str, bytes]]]:
-    """(body_text, [(mime, bytes), ...]) — text plus every inline/attached image."""
+    """(body_text, [(mime, bytes), ...]) — text plus inline/attached images.
+
+    Image collection is bounded (count + pre-decode size) because email bytes
+    are untrusted; the caller (`_prepare_image_keys`) applies the final filters.
+    """
     plain, html = "", ""
     images: list[tuple[str, bytes]] = []
+    # base64 inflates ~4/3; skip a part whose encoded size can't fit the cap.
+    enc_cap = int(IMAGE_MAX_BYTES * 4 / 3) + 1024
     parts = list(msg.walk()) if msg.is_multipart() else [msg]
     for part in parts:
         if part.is_multipart():
             continue
         ctype = (part.get_content_type() or "").lower()
         if part.get_content_maintype() == "image":
+            if len(images) >= _MAX_IMAGE_PARTS_SCANNED or _encoded_len(part) > enc_cap:
+                continue
             try:
                 data = part.get_payload(decode=True)
             except Exception:
                 data = None
-            if data:
+            if data and len(data) <= IMAGE_MAX_BYTES:
                 images.append((ctype, data))
             continue
         disp = str(part.get("Content-Disposition") or "").lower()
@@ -410,14 +432,20 @@ def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str
         elif ctype == "text/html" and not html:
             html = _decode_part(part)
     text = plain.strip() or _html_to_text(html)
-    # Images embedded directly in the HTML as data: URIs.
+    # Images embedded directly in the HTML as data: URIs (also bounded).
     if html:
         for m in _DATA_URI_RE.finditer(html):
+            if len(images) >= _MAX_IMAGE_PARTS_SCANNED:
+                break
+            b64 = re.sub(r"\s+", "", m.group(2))
+            if len(b64) > enc_cap:
+                continue
             try:
-                images.append((f"image/{m.group(1).lower().replace('jpg', 'jpeg')}",
-                               base64.b64decode(re.sub(r"\s+", "", m.group(2)))))
+                data = base64.b64decode(b64)
             except Exception:
-                pass
+                continue
+            if len(data) <= IMAGE_MAX_BYTES:
+                images.append((f"image/{m.group(1).lower().replace('jpg', 'jpeg')}", data))
     # Drop [image]/[cid:…] placeholder tokens now that real images are shown.
     text = _IMG_PLACEHOLDER_RE.sub("", text)
     text = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", text).strip()
