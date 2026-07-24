@@ -15,6 +15,7 @@ Lark chat.
 | `@TObot <email title>` | Same as `/search` (in P2P chat just type the title) |
 | `/csupdate` + one email title per line | AI review of the **whole thread** (qwen): reads every message **and its images**, explains the issue, the solution if present, the current status, and flags `⚠️ NEEDS UPDATE` when the newest message is ≥2 days old and unresolved |
 | `/searchwithai` + one email title per line | AI review of the **latest message only** (qwen): faster — summary, status, and freshness of just the newest email in each thread |
+| `/searchwithoutai` + one email title per line | Just the **latest message** (sender + content + images), **no AI** — the quick "what's the newest reply" view |
 | `/scan` | Force an immediate mailbox re-scan |
 | `/status` | Index size, retention window, last scan (per folder) |
 | `/help` | Help |

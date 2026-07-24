@@ -1923,6 +1923,42 @@ def _do_searchwithai(chat_id: str, message_id: str, arg: str) -> None:
     )
 
 
+def _do_searchwithoutai(chat_id: str, message_id: str, arg: str) -> None:
+    """Show ONLY the latest message of each thread — content + images, no AI."""
+    titles = _parse_csupdate_titles(arg)
+    if not titles:
+        reply_text(chat_id, message_id,
+                   "Usage:\n/searchwithoutai\n<email title 1>\n<email title 2>\n…\n"
+                   "Shows the LATEST message of each thread (sender + content + images), "
+                   "no AI. Use /search for the whole conversation.")
+        return
+    titles = titles[:CSUPDATE_MAX_THREADS]
+    for title in titles:
+        entries = _resolve_thread(title)
+        if not entries:
+            reply_text(chat_id, message_id, _not_found_msg(title))
+            continue
+        latest = entries[-1]
+        try:
+            withbody = fetch_contents([latest], limit=1)[0]
+        except Exception as ex:
+            reply_text(chat_id, message_id, f"❌ “{title}”: {ex!r}")
+            continue
+        cards = _cards_for_entries(latest.get("subject") or title, [withbody], None)
+        if len(entries) > 1:
+            cards[0]["elements"].insert(0, {
+                "tag": "markdown",
+                "content": f"*📩 Latest message — newest of {len(entries)} in this thread*",
+            })
+        ok_sent = True
+        for c in cards:
+            if not reply_card(chat_id, message_id, c):
+                ok_sent = False
+                break
+        if not ok_sent:
+            reply_text(chat_id, message_id, _format_details(withbody))
+
+
 # ===================== Command router =====================
 HELP_TEXT = (
     "TObot — email search bot 📮\n"
@@ -1938,6 +1974,8 @@ HELP_TEXT = (
     "  and explains the issue, solution, status, and if it NEEDS UPDATE\n"
     "/searchwithai + one email title per line — AI reads only the LATEST message\n"
     "  of each and summarizes it (faster than /csupdate)\n"
+    "/searchwithoutai + one email title per line — shows just the LATEST message\n"
+    "  (content + images), no AI\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -1998,8 +2036,11 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
         return
     low = t.lower()
     action = None
-    # /searchwithai must be tested before /search (it is a prefix of the other).
-    if low.startswith("/searchwithai"):
+    # The /searchwith* variants must be tested before plain /search — each has
+    # "/search" as a prefix and would otherwise be swallowed by it.
+    if low.startswith("/searchwithoutai"):
+        action = lambda: _do_searchwithoutai(chat_id, message_id, t[len("/searchwithoutai"):])
+    elif low.startswith("/searchwithai"):
         action = lambda: _do_searchwithai(chat_id, message_id, t[len("/searchwithai"):])
     elif low.startswith("/search"):
         action = lambda: _search_and_reply(chat_id, message_id, t[len("/search"):])
