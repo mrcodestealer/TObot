@@ -2053,11 +2053,14 @@ def _reply_subject(subject: str) -> str:
 
 def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
                         entries: list[dict[str, Any]]) -> dict[str, Any]:
-    """Reply-all spec for one thread, from its LATEST message.
+    """Reply-all spec for one thread.
 
-    To = latest sender + its To recipients; Cc = its Cc — own address removed,
-    order kept, deduped. Uses the live message when fetchable (accurate headers
-    + References for threading), falling back to the indexed headers.
+    To = the LATEST message's sender + its To recipients. Cc = EVERYONE who
+    appeared anywhere in the thread (From/To/Cc of every message) — so a
+    participant isn't dropped just because the newest reply went person-to-
+    person without the usual Cc list. Own address removed, order kept, deduped.
+    Uses the live latest message when fetchable (accurate headers + References
+    for threading), falling back to the indexed headers.
     """
     latest = entries[-1]
     frm = list(latest.get("from") or [])
@@ -2078,8 +2081,15 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
         if al and al not in own and al not in seen:
             seen.add(al)
             to_out.append(a.strip())
+    # Cc: the latest message's Cc first, then every other participant seen in
+    # the whole thread (oldest→newest), so the full distribution stays intact.
+    thread_addrs: list[str] = list(cc)
+    for e in entries:
+        thread_addrs.extend(e.get("from") or [])
+        thread_addrs.extend(e.get("to") or [])
+        thread_addrs.extend(e.get("cc") or [])
     cc_out: list[str] = []
-    for a in cc:
+    for a in thread_addrs:
         al = a.strip().casefold()
         if al and al not in own and al not in seen:
             seen.add(al)
