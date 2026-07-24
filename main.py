@@ -408,6 +408,19 @@ _DATA_URI_RE = re.compile(r"data:image/(png|jpe?g|gif|webp|bmp);base64,([A-Za-z0
 # inline image is never base64-decoded just to be thrown away by the filter).
 _MAX_IMAGE_PARTS_SCANNED = 40
 
+# Where the quoted previous-message history begins inside an HTML reply — used
+# to keep only images that belong to the NEW part of the message (a reply
+# re-embeds the whole prior thread's inline images, which we must NOT re-show).
+_HTML_QUOTE_BOUNDARY = re.compile(
+    r"<blockquote\b"
+    r'|class=["\']?[^"\']*gmail_quote'
+    r'|id=["\']?(?:divRplyFwdMsg|OLK_SRC_BODY_SECTION|mail-editor-reference-message-container|appendonsend)'
+    r'|<div[^>]+border-top:[^>]*>\s*(?:<[^>]+>\s*)*(?:from|发件人|寄件者|de)\s*[:：]'
+    r"|(?:<b>|<strong>)\s*(?:from|发件人|寄件者)\s*[:：]",
+    re.I,
+)
+_CID_SRC_RE = re.compile(r"""src\s*=\s*["']?\s*cid:([^"'>\s]+)""", re.I)
+
 
 def _encoded_len(part: email.message.Message) -> int:
     try:
@@ -417,30 +430,49 @@ def _encoded_len(part: email.message.Message) -> int:
         return 0
 
 
-def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str, bytes]]]:
-    """(body_text, [(mime, bytes), ...]) — text plus inline/attached images.
+def _cid_key(raw_cid: str) -> str:
+    """Normalize a Content-ID / cid reference for matching (drop <>, @domain)."""
+    c = (raw_cid or "").strip().strip("<>").strip().lower()
+    return c.split("@", 1)[0] if "@" in c else c
 
-    Image collection is bounded (count + pre-decode size) because email bytes
-    are untrusted; the caller (`_prepare_image_keys`) applies the final filters.
+
+def _html_new_region(html: str) -> tuple[str, bool]:
+    """(head_html_before_quoted_history, quote_boundary_found)."""
+    m = _HTML_QUOTE_BOUNDARY.search(html or "")
+    if m:
+        return html[:m.start()], True
+    return html, False
+
+
+def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str, bytes]]]:
+    """(body_text, [(mime, bytes), ...]) — text plus the NEW message's images.
+
+    A reply re-embeds every earlier message's inline images; on a reply we keep
+    only images referenced in the new (pre-quote) HTML — plus genuine
+    attachments — so quoted-history pictures aren't re-shown. An original email
+    (no quoted history) keeps all its images. Bounded because email bytes are
+    untrusted; the caller applies the final size/count filters.
     """
     plain, html = "", ""
-    images: list[tuple[str, bytes]] = []
-    # base64 inflates ~4/3; skip a part whose encoded size can't fit the cap.
-    enc_cap = int(IMAGE_MAX_BYTES * 4 / 3) + 1024
+    # Collected image parts as (mime, data, cid_key, is_attachment).
+    img_parts: list[tuple[str, bytes, str, bool]] = []
+    enc_cap = int(IMAGE_MAX_BYTES * 4 / 3) + 1024  # base64 inflates ~4/3
     parts = list(msg.walk()) if msg.is_multipart() else [msg]
     for part in parts:
         if part.is_multipart():
             continue
         ctype = (part.get_content_type() or "").lower()
         if part.get_content_maintype() == "image":
-            if len(images) >= _MAX_IMAGE_PARTS_SCANNED or _encoded_len(part) > enc_cap:
+            if len(img_parts) >= _MAX_IMAGE_PARTS_SCANNED or _encoded_len(part) > enc_cap:
                 continue
             try:
                 data = part.get_payload(decode=True)
             except Exception:
                 data = None
             if data and len(data) <= IMAGE_MAX_BYTES:
-                images.append((ctype, data))
+                disp = str(part.get("Content-Disposition") or "").lower()
+                img_parts.append((ctype, data, _cid_key(part.get("Content-ID") or ""),
+                                  "attachment" in disp))
             continue
         disp = str(part.get("Content-Disposition") or "").lower()
         if "attachment" in disp:
@@ -450,9 +482,26 @@ def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str
         elif ctype == "text/html" and not html:
             html = _decode_part(part)
     text = plain.strip() or _html_to_text(html)
-    # Images embedded directly in the HTML as data: URIs (also bounded).
-    if html:
-        for m in _DATA_URI_RE.finditer(html):
+
+    head_html, quoted = _html_new_region(html) if html else ("", False)
+    new_cids = {_cid_key(c) for c in _CID_SRC_RE.findall(head_html)} if html else set()
+    images: list[tuple[str, bytes]] = []
+    for mime, data, cid, is_att in img_parts:
+        if not html or not quoted:
+            keep = True                    # original email (or no HTML) — keep all
+        elif cid and cid in new_cids:
+            keep = True                    # inline image referenced in the new part
+        elif is_att and not cid:
+            keep = True                    # a genuine attachment on this message
+        else:
+            keep = False                   # inline image only in quoted history
+        if keep:
+            images.append((mime, data))
+
+    # Data: URI images embedded in the (new region of the) HTML.
+    src_html = head_html if html else ""
+    if src_html:
+        for m in _DATA_URI_RE.finditer(src_html):
             if len(images) >= _MAX_IMAGE_PARTS_SCANNED:
                 break
             b64 = re.sub(r"\s+", "", m.group(2))
