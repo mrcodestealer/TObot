@@ -2185,8 +2185,9 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 "width": "fill",
                 "label": {"tag": "plain_text", "content": "Content"},
                 "label_position": "top",
-                # Template pre-filled in the box; the user edits it in place.
-                "default_value": f"{_REPLY_GREETING}\n\n\n\n{_REPLY_CLOSING}",
+                # Template pre-filled in the box; the user edits it in place
+                # (blank lines below the closing too, for the sign-off).
+                "default_value": f"{_REPLY_GREETING}\n\n\n\n{_REPLY_CLOSING}\n\n",
                 "placeholder": {"tag": "plain_text",
                                 "content": "Write the reply content…"},
                 "required": True,
