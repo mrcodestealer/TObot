@@ -1713,33 +1713,14 @@ def _image_data_uri(mime: str, data: bytes) -> str:
     return f"data:{mime or 'image/png'};base64," + base64.b64encode(data).decode()
 
 
-def _csupdate_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str, str]:
-    """(thread_title, analysis_text) — raises on hard failures."""
-    entries = _resolve_thread(title)
-    if not entries:
-        return title, (f"No email found for “{title}” in the last {WINDOW_DAYS} days — "
-                       "check the title with /search first.")
-    mails: list[dict[str, Any]] = []
-    images: list[tuple[str, bytes]] = []
-    for e in entries:
-        text = ""
-        msg = _fetch_content_for_entry(mail, e) if mail is not None else None
-        if msg is not None:
-            text, imgs = extract_email_parts(msg)
-            images.extend(imgs)
-        if HIDE_QUOTED_HISTORY:
-            stripped = strip_quoted_history(text)
-            text = stripped or text
-        mails.append({
-            "from": e.get("from_raw") or ", ".join(e.get("from") or []) or "?",
-            "date": _fmt_date(e),
-            "text": text,
-        })
-    days_old = _days_since_ts(float(entries[-1].get("date_ts") or 0.0))
-    # Prefer big images (screenshots) over signature logos; dedupe by content.
+def _pick_thread_images(images: list[tuple[str, bytes]], cap: int) -> list[tuple[str, bytes]]:
+    """Biggest-first (screenshots outrank signature logos), deduped by content,
+    tiny images dropped, capped at ``cap``."""
     seen_h: set[str] = set()
     uniq: list[tuple[str, bytes]] = []
     for mime, data in sorted(images, key=lambda t: len(t[1]), reverse=True):
+        if len(uniq) >= cap:
+            break
         if not data or len(data) < IMAGE_MIN_BYTES:
             continue
         h = hashlib.sha256(data).hexdigest()
@@ -1747,24 +1728,24 @@ def _csupdate_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str
             continue
         seen_h.add(h)
         uniq.append((mime, data))
-        if len(uniq) >= CSUPDATE_MAX_IMAGES:
-            break
-    system, user_text = _build_csupdate_prompt(
-        entries[0].get("subject") or title, mails, days_old, len(uniq))
+    return uniq
+
+
+def _llm_analyze(system: str, user_text: str, images: list[tuple[str, bytes]]) -> str:
+    """One qwen call; images sent as data: URIs, with a text-only retry if the
+    model rejects them. Raises on empty/failed text-only result."""
     content: Any = user_text
-    if uniq:
+    if images:
         content = [{"type": "text", "text": user_text}] + [
             {"type": "image_url", "image_url": {"url": _image_data_uri(m, d)}}
-            for m, d in uniq
+            for m, d in images
         ]
-    messages = [{"role": "system", "content": system},
-                {"role": "user", "content": content}]
     try:
-        analysis = _llm_chat(messages)
+        analysis = _llm_chat([{"role": "system", "content": system},
+                              {"role": "user", "content": content}])
     except Exception as ex:
-        if uniq:
-            # Model may not accept images — retry text-only.
-            print(f"[csupdate] retrying without images: {ex!r}", flush=True)
+        if images:
+            print(f"[ai] retrying without images: {ex!r}", flush=True)
             analysis = _llm_chat([{"role": "system", "content": system},
                                   {"role": "user", "content": user_text}])
             analysis += "\n\n_(note: the model could not view the attached images)_"
@@ -1772,14 +1753,90 @@ def _csupdate_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str
             raise
     if not analysis.strip():
         raise RuntimeError("LLM returned an empty answer")
-    return entries[0].get("subject") or title, analysis.strip()
+    return analysis.strip()
 
 
-def _csupdate_card(title: str, analysis: str) -> dict[str, Any]:
+def _not_found_msg(title: str) -> str:
+    return (f"No email found for “{title}” in the last {WINDOW_DAYS} days — "
+            "check the title with /search first.")
+
+
+def _mail_view(mail: Optional[imaplib.IMAP4], e: dict[str, Any]
+               ) -> tuple[dict[str, Any], list[tuple[str, bytes]]]:
+    """Fetch one entry's content live → ({from,date,text}, images)."""
+    text = ""
+    images: list[tuple[str, bytes]] = []
+    msg = _fetch_content_for_entry(mail, e) if mail is not None else None
+    if msg is not None:
+        text, images = extract_email_parts(msg)
+    if HIDE_QUOTED_HISTORY:
+        text = strip_quoted_history(text) or text
+    return {"from": e.get("from_raw") or ", ".join(e.get("from") or []) or "?",
+            "date": _fmt_date(e), "text": text}, images
+
+
+def _csupdate_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str, str]:
+    """(thread_title, analysis_text) — reviews the WHOLE thread."""
+    entries = _resolve_thread(title)
+    if not entries:
+        return title, _not_found_msg(title)
+    mails: list[dict[str, Any]] = []
+    images: list[tuple[str, bytes]] = []
+    for e in entries:
+        view, imgs = _mail_view(mail, e)
+        mails.append(view)
+        images.extend(imgs)
+    days_old = _days_since_ts(float(entries[-1].get("date_ts") or 0.0))
+    uniq = _pick_thread_images(images, CSUPDATE_MAX_IMAGES)
+    system, user_text = _build_csupdate_prompt(
+        entries[0].get("subject") or title, mails, days_old, len(uniq))
+    return entries[0].get("subject") or title, _llm_analyze(system, user_text, uniq)
+
+
+def _build_searchwithai_prompt(title: str, view: dict[str, Any],
+                               days_old: int, image_count: int) -> tuple[str, str]:
+    """(system, user_text) for reviewing ONLY the latest message of a thread."""
+    today = datetime.now(_local_tz()).strftime("%Y-%m-%d")
+    system = (
+        "You are an operations assistant for the duty team. You are shown ONLY the "
+        f"LATEST email of a thread. Today is {today} ({MAIL_TZ}). Answer concisely:\n"
+        "1. SUMMARY — what this latest message says (the key point / request / answer).\n"
+        "2. STATUS — from this message, is the matter resolved, waiting on someone, or ongoing?\n"
+        f"3. FRESHNESS — this message is {days_old} day(s) old (sent {view.get('date')}). "
+        f"If {CSUPDATE_STALE_DAYS}+ days old and not resolved, start with '⚠️ NEEDS UPDATE'.\n"
+        "If images are attached, use them and mention what you see. "
+        "Do not invent facts not present in the message."
+    )
+    text = (view.get("text") or "").strip() or "(no text content)"
+    if len(text) > CSUPDATE_CHARS_PER_MAIL:
+        text = text[:CSUPDATE_CHARS_PER_MAIL].rstrip() + " …(trimmed)"
+    parts = [f'Latest email in thread: "{title}"',
+             f"From: {view.get('from') or '?'} | Date: {view.get('date') or '?'}"]
+    if image_count:
+        parts.append(f"({image_count} image(s) attached after the text.)")
+    parts.append("\n" + text)
+    return system, "\n".join(parts)
+
+
+def _searchwithai_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str, str]:
+    """(thread_title, analysis_text) — reviews ONLY the newest message."""
+    entries = _resolve_thread(title)
+    if not entries:
+        return title, _not_found_msg(title)
+    latest = entries[-1]
+    view, images = _mail_view(mail, latest)
+    days_old = _days_since_ts(float(latest.get("date_ts") or 0.0))
+    uniq = _pick_thread_images(images, CSUPDATE_MAX_IMAGES)
+    system, user_text = _build_searchwithai_prompt(
+        latest.get("subject") or title, view, days_old, len(uniq))
+    shown = entries[0].get("subject") or title
+    return shown, _llm_analyze(system, user_text, uniq)
+
+
+def _ai_card(title: str, analysis: str, subtitle: str) -> dict[str, Any]:
     elements = [{"tag": "markdown", "content": piece}
                 for piece in _split_body(analysis, CARD_CHARS_BUDGET)]
-    elements.append({"tag": "markdown",
-                     "content": f"*AI review by {CSUPDATE_MODEL} — verify before replying to the thread.*"})
+    elements.append({"tag": "markdown", "content": subtitle})
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -1790,13 +1847,21 @@ def _csupdate_card(title: str, analysis: str) -> dict[str, Any]:
     }
 
 
-def _do_csupdate(chat_id: str, message_id: str, arg: str) -> None:
+def _csupdate_card(title: str, analysis: str) -> dict[str, Any]:
+    return _ai_card(title, analysis,
+                    f"*AI review by {CSUPDATE_MODEL} — verify before replying to the thread.*")
+
+
+def _run_ai_command(chat_id: str, message_id: str, arg: str, *,
+                    label: str, usage: str, reviewer, subtitle: str) -> None:
+    """Shared multi-title AI driver for /csupdate and /searchwithai.
+
+    ``reviewer(mail, title) -> (shown_title, analysis)``; one card per title,
+    processed sequentially, reconnecting IMAP once on a stale connection.
+    """
     titles = _parse_csupdate_titles(arg)
     if not titles:
-        reply_text(chat_id, message_id,
-                   "Usage:\n/csupdate\n<email title 1>\n<email title 2>\n…\n"
-                   "Each title gets an AI review: issue, solution, status, and "
-                   "whether the thread needs a follow-up.")
+        reply_text(chat_id, message_id, usage)
         return
     dropped = 0
     if len(titles) > CSUPDATE_MAX_THREADS:
@@ -1804,29 +1869,29 @@ def _do_csupdate(chat_id: str, message_id: str, arg: str) -> None:
         titles = titles[:CSUPDATE_MAX_THREADS]
     note = f" (first {CSUPDATE_MAX_THREADS} only — {dropped} skipped)" if dropped else ""
     reply_text(chat_id, message_id,
-               f"🤖 Reviewing {len(titles)} thread(s) with {CSUPDATE_MODEL}{note} — "
-               "this can take a few minutes per thread…")
+               f"🤖 Reviewing {len(titles)} email(s) with {CSUPDATE_MODEL}{note} — "
+               "this can take a few minutes each…")
     try:
         mail = _connect_imap()
     except Exception as ex:
-        print(f"[csupdate] IMAP connect failed: {ex!r}", flush=True)
+        print(f"[{label}] IMAP connect failed: {ex!r}", flush=True)
         mail = None
     try:
         for title in titles:
             try:
-                shown_title, analysis = _csupdate_review_one(mail, title)
+                shown_title, analysis = reviewer(mail, title)
             except ImapStaleConnectionError as ex:
-                print(f"[csupdate] {ex} — reconnecting", flush=True)
+                print(f"[{label}] {ex} — reconnecting", flush=True)
                 try:
                     mail = _connect_imap()
-                    shown_title, analysis = _csupdate_review_one(mail, title)
+                    shown_title, analysis = reviewer(mail, title)
                 except Exception as ex2:
                     reply_text(chat_id, message_id, f"❌ “{title}”: {ex2!r}")
                     continue
             except Exception as ex:
                 reply_text(chat_id, message_id, f"❌ “{title}”: {ex!r}")
                 continue
-            if not reply_card(chat_id, message_id, _csupdate_card(shown_title, analysis)):
+            if not reply_card(chat_id, message_id, _ai_card(shown_title, analysis, subtitle)):
                 reply_text(chat_id, message_id, f"🤖 {shown_title}\n──────────\n{analysis}")
     finally:
         if mail is not None:
@@ -1834,6 +1899,28 @@ def _do_csupdate(chat_id: str, message_id: str, arg: str) -> None:
                 mail.logout()
             except Exception:
                 pass
+
+
+def _do_csupdate(chat_id: str, message_id: str, arg: str) -> None:
+    _run_ai_command(
+        chat_id, message_id, arg, label="csupdate",
+        usage=("Usage:\n/csupdate\n<email title 1>\n<email title 2>\n…\n"
+               "Each title gets a full-thread AI review: issue, solution, status, "
+               "and whether the thread needs a follow-up."),
+        reviewer=_csupdate_review_one,
+        subtitle=f"*AI review by {CSUPDATE_MODEL} — verify before replying to the thread.*",
+    )
+
+
+def _do_searchwithai(chat_id: str, message_id: str, arg: str) -> None:
+    _run_ai_command(
+        chat_id, message_id, arg, label="searchwithai",
+        usage=("Usage:\n/searchwithai\n<email title 1>\n<email title 2>\n…\n"
+               "Each title gets an AI review of the LATEST message only: summary, "
+               "status, and whether it needs an update."),
+        reviewer=_searchwithai_review_one,
+        subtitle=f"*AI summary of the latest email by {CSUPDATE_MODEL} — verify before acting.*",
+    )
 
 
 # ===================== Command router =====================
@@ -1847,8 +1934,10 @@ HELP_TEXT = (
     "/search <Message-ID> — direct exact lookup (the accurate key)\n"
     "/search <No.> — open result N from your last search listing\n"
     "@TObot <email title> — same as /search (in P2P just type the title)\n"
-    "/csupdate + one email title per line — AI reads each thread (images too)\n"
+    "/csupdate + one email title per line — AI reads each FULL thread (images too)\n"
     "  and explains the issue, solution, status, and if it NEEDS UPDATE\n"
+    "/searchwithai + one email title per line — AI reads only the LATEST message\n"
+    "  of each and summarizes it (faster than /csupdate)\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -1909,7 +1998,10 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
         return
     low = t.lower()
     action = None
-    if low.startswith("/search"):
+    # /searchwithai must be tested before /search (it is a prefix of the other).
+    if low.startswith("/searchwithai"):
+        action = lambda: _do_searchwithai(chat_id, message_id, t[len("/searchwithai"):])
+    elif low.startswith("/search"):
         action = lambda: _search_and_reply(chat_id, message_id, t[len("/search"):])
     elif low.startswith("/csupdate"):
         action = lambda: _do_csupdate(chat_id, message_id, t[len("/csupdate"):])
