@@ -545,7 +545,9 @@ def extract_body_text(msg: email.message.Message) -> str:
 
 
 def _addr_list(raw: str) -> list[str]:
-    return [a for _n, a in getaddresses([raw or ""]) if a and "@" in a]
+    """Addresses from a header value. Semicolon separators (Outlook/Lark style)
+    make getaddresses return nothing — normalize them to commas first."""
+    return [a for _n, a in getaddresses([(raw or "").replace(";", ",")]) if a and "@" in a]
 
 
 def message_to_entry(msg: email.message.Message, *, folder: str, uid: str,
@@ -1131,7 +1133,7 @@ def _entry_matches_message(e: dict[str, Any], msg: email.message.Message) -> boo
             return False
     want_from = ((e.get("from") or [""])[0] or "").casefold()
     if want_from:
-        got_from = [a.casefold() for _n, a in getaddresses([msg.get("From") or ""]) if a]
+        got_from = [a.casefold() for a in _addr_list(msg.get("From") or "")]
         if got_from and want_from not in got_from:
             return False
     return True
@@ -2069,9 +2071,9 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
     references = ""
     msg = _fetch_content_for_entry(mail, latest) if mail is not None else None
     if msg is not None:
-        frm = [a for _n, a in getaddresses([msg.get("From") or ""]) if a and "@" in a] or frm
-        to = [a for _n, a in getaddresses([msg.get("To") or ""]) if a and "@" in a] or to
-        cc = [a for _n, a in getaddresses([msg.get("Cc") or ""]) if a and "@" in a]
+        frm = _addr_list(msg.get("From") or "") or frm
+        to = _addr_list(msg.get("To") or "") or to
+        cc = _addr_list(msg.get("Cc") or "")
         references = re.sub(r"\s+", " ", msg.get("References") or "").strip()
     own = _own_addresses()
     to_out: list[str] = []
@@ -2084,6 +2086,14 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
     # Cc: the latest message's Cc first, then every other participant seen in
     # the whole thread (oldest→newest), so the full distribution stays intact.
     thread_addrs: list[str] = list(cc)
+    # The ORIGINAL email usually carries the canonical distribution list; fetch
+    # it live (it may sit in an unindexed folder, and older index entries may
+    # predate the semicolon-Cc parsing fix).
+    if len(entries) > 1 and mail is not None:
+        orig_msg = _fetch_content_for_entry(mail, entries[0])
+        if orig_msg is not None:
+            for hdr in ("From", "To", "Cc"):
+                thread_addrs.extend(_addr_list(orig_msg.get(hdr) or ""))
     for e in entries:
         thread_addrs.extend(e.get("from") or [])
         thread_addrs.extend(e.get("to") or [])
