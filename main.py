@@ -2126,26 +2126,29 @@ def _esc_addrs(addrs: list[str]) -> str:
     return ", ".join(addrs).replace("<", "‹").replace(">", "›") or "(none)"
 
 
+def _md(content: str) -> dict[str, Any]:
+    return {"tag": "div", "text": {"tag": "lark_md", "content": content}}
+
+
 def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Card schema 2.0 — same structure as osedutybot's proven form cards."""
     n = len(specs)
-    elements: list[dict[str, Any]] = [{
-        "tag": "markdown",
-        "content": (f"✅ **All {n} email(s) found.** The same content will be sent to "
-                    "each thread — every reply uses ITS OWN recipients "
-                    "(reply-all to that thread's latest message):"),
-    }]
+    elements: list[dict[str, Any]] = [_md(
+        f"✅ **All {n} email(s) found.** The same content will be sent to "
+        "each thread — every reply uses ITS OWN recipients "
+        "(reply-all to that thread's latest message):")]
     for i, s in enumerate(specs, 1):
         elements.append({"tag": "hr"})
-        elements.append({"tag": "markdown", "content": "\n".join([
+        elements.append(_md("\n".join([
             f"**#{i} {s['title']}**",
             f"**To:** {_esc_addrs(s['to'])}",
             f"**Cc:** {_esc_addrs(s['cc'])}",
             f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*",
-        ])})
+        ])))
     elements.append({"tag": "hr"})
-    elements.append({"tag": "markdown", "content": (
+    elements.append(_md(
         "**Each email will be sent as:**\n"
-        f"{_REPLY_GREETING}\n\n*(the content you fill in below)*\n\n{_REPLY_CLOSING}")})
+        f"{_REPLY_GREETING}\n\n*(the content you fill in below)*\n\n{_REPLY_CLOSING}"))
     elements.append({
         "tag": "form",
         "name": "reply_form",
@@ -2153,46 +2156,47 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
             {
                 "tag": "input",
                 "name": "reply_content",
-                "required": True,
                 "input_type": "multiline_text",
                 "rows": 8,
-                "max_length": 5000,
+                "auto_resize": True,
+                "width": "fill",
                 "label": {"tag": "plain_text", "content": "Content"},
+                "label_position": "top",
                 "placeholder": {"tag": "plain_text",
                                 "content": "Fill in the middle content of the reply…"},
+                "required": True,
+                "max_length": 5000,
             },
             {
                 "tag": "button",
-                "action_type": "form_submit",
                 "name": "send_reply",
                 "text": {"tag": "plain_text", "content": f"📤 Send reply to all {n} email(s)"},
                 "type": "primary",
-                "value": {"batch": batch_id, "action": "send"},
-                "confirm": {
-                    "title": {"tag": "plain_text", "content": "Send replies?"},
-                    "text": {"tag": "plain_text",
-                             "content": f"This sends {n} real email(s) from {MAIL_USER}."},
-                },
+                "form_action_type": "submit",
+                "behaviors": [
+                    {"type": "callback", "value": {"batch": batch_id, "action": "send"}},
+                ],
             },
         ],
     })
     elements.append({
-        "tag": "action",
-        "actions": [{
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "✖️ Cancel — send nothing"},
-            "type": "danger",
-            "value": {"batch": batch_id, "action": "cancel"},
-        }],
+        "tag": "button",
+        "name": "cancel_reply",
+        "text": {"tag": "plain_text", "content": "✖️ Cancel — send nothing"},
+        "type": "danger",
+        "behaviors": [
+            {"type": "callback", "value": {"batch": batch_id, "action": "cancel"}},
+        ],
     })
     return {
-        "config": {"wide_screen_mode": True},
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
         "header": {
+            "template": "green",
             "title": {"tag": "plain_text",
                       "content": f"✉️ Reply All — {n} email(s) ready"[:150]},
-            "template": "green",
         },
-        "elements": elements,
+        "body": {"elements": elements},
     }
 
 
@@ -2292,12 +2296,13 @@ def _send_reply_batch(batch: dict[str, Any], content: str) -> None:
 
 
 def _reply_done_card(text: str, template: str) -> dict[str, Any]:
-    """Replacement card shown after Send/Cancel so the form disappears."""
+    """Replacement card (schema 2.0) shown after Send/Cancel — form disappears."""
     return {
-        "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": "✉️ Reply All"},
-                   "template": template},
-        "elements": [{"tag": "markdown", "content": text}],
+        "schema": "2.0",
+        "config": {"update_multi": True, "width_mode": "fill"},
+        "header": {"template": template,
+                   "title": {"tag": "plain_text", "content": "✉️ Reply All"}},
+        "body": {"elements": [_md(text)]},
     }
 
 
