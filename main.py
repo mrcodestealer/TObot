@@ -483,23 +483,38 @@ def extract_email_parts(msg: email.message.Message) -> tuple[str, list[tuple[str
             html = _decode_part(part)
     text = plain.strip() or _html_to_text(html)
 
+    # Is this a reply/forward? The subject prefix (Re:/Fwd:/回复/转发…) is the
+    # reliable signal; a detected HTML quote boundary also counts. On a reply we
+    # must not re-show the quoted chain's inline images. When we CAN localize the
+    # new region (boundary found) we keep images referenced there; when we can't,
+    # we drop all inline images and keep only genuine attachments — erring toward
+    # hiding quoted pictures rather than showing the wrong ones.
+    subj = _decode_hdr(msg.get("Subject"))
+    norm_subj = re.sub(r"\s+", " ", subj.casefold().strip())
     head_html, quoted = _html_new_region(html) if html else ("", False)
-    new_cids = {_cid_key(c) for c in _CID_SRC_RE.findall(head_html)} if html else set()
+    is_reply = quoted or (bool(norm_subj) and _base_subject(subj) != norm_subj)
+    new_cids = {_cid_key(c) for c in _CID_SRC_RE.findall(head_html)} if (html and quoted) else set()
     images: list[tuple[str, bytes]] = []
     for mime, data, cid, is_att in img_parts:
-        if not html or not quoted:
-            keep = True                    # original email (or no HTML) — keep all
-        elif cid and cid in new_cids:
+        if not is_reply:
+            keep = True                    # original message — keep all its images
+        elif is_att:
+            keep = True                    # a file attached to THIS message
+        elif quoted and cid and cid in new_cids:
             keep = True                    # inline image referenced in the new part
-        elif is_att and not cid:
-            keep = True                    # a genuine attachment on this message
         else:
-            keep = False                   # inline image only in quoted history
+            keep = False                   # quoted-history inline image
         if keep:
             images.append((mime, data))
 
-    # Data: URI images embedded in the (new region of the) HTML.
-    src_html = head_html if html else ""
+    # Data: URI images: whole HTML for an original, only the new region for a
+    # reply with a known boundary, none for a reply we couldn't localize.
+    if not is_reply:
+        src_html = html
+    elif quoted:
+        src_html = head_html
+    else:
+        src_html = ""
     if src_html:
         for m in _DATA_URI_RE.finditer(src_html):
             if len(images) >= _MAX_IMAGE_PARTS_SCANNED:
