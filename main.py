@@ -19,6 +19,8 @@ Commands (group chat or P2P):
     /search <Message-ID>    exact lookup — shows full details (From/To/Cc/date
                             + body content)
     /search <No.>           open result N from your previous /search listing
+    /machine <name(s)>      machine status card (🟢/🔴 emoji) from
+                            webmachine_data.json (kept fresh by the scrape)
     /scan                   force an immediate mailbox re-scan
     /status                 index size, window, last scan time
     /help                   this help
@@ -2404,6 +2406,8 @@ HELP_TEXT = (
     "  (content + images), no AI\n"
     "/reply + one email title per line — shows every email's reply-all To/Cc in\n"
     "  a card; fill in ONE content and press Send to reply-all to each of them\n"
+    "/machine <name(s)> — machine status card from the live scrape\n"
+    "  (🟢 online / 🔴 offline · 🛠️ maintain / ✅ normal · 🧪 test; digits work: /machine 2205)\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2451,6 +2455,181 @@ def _do_scan_command(chat_id: str, message_id: str) -> None:
         reply_text(chat_id, message_id, f"❌ Scan failed: {ex!r}")
 
 
+# ===================== /machine — status card from webmachine_data.json =====================
+# Answers straight from the snapshot the background scrape (webmachine.py +
+# smmachine.py) keeps fresh — instant reply, no browser is launched here.
+
+_MACHINE_ENV_ORDER = {"PROD": 0, "QAT": 1, "UAT": 2}
+_MACHINE_MATCH_CAP = 60
+_MACHINE_USAGE = (
+    "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
+    "(`/machine 2205`), several names separated by spaces or new lines."
+)
+
+
+def _machine_alnum(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", s or "").upper()
+
+
+def _machine_data_path() -> str:
+    try:
+        from webmachine import _data_json_path
+
+        return str(_data_json_path())
+    except Exception:
+        return os.path.join(_ROOT, "webmachine_data.json")
+
+
+def _machine_load_rows() -> tuple[list[dict[str, Any]], str, float]:
+    """(rows, data path, file mtime) — empty rows + mtime 0.0 when no snapshot yet."""
+    path = _machine_data_path()
+    try:
+        mtime = os.path.getmtime(path)
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return [], path, 0.0
+    rows = raw if isinstance(raw, list) else []
+    return [r for r in rows if isinstance(r, dict)], path, mtime
+
+
+def _machine_match_rows(tokens: list[str],
+                        rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Exact alnum name match per token, else substring (so `2205` finds NWR2205)."""
+    named = []
+    for r in rows:
+        na = _machine_alnum(str(r.get("name") or ""))
+        if na:
+            named.append((na, r))
+    matched: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    not_found: list[str] = []
+    for tok in tokens:
+        ta = _machine_alnum(tok)
+        if not ta:
+            continue
+        hits = [r for na, r in named if na == ta] or [r for na, r in named if ta in na]
+        if not hits:
+            not_found.append(tok)
+            continue
+        for r in hits:
+            key = (str(r.get("environment")), str(r.get("belongs")), str(r.get("name")))
+            if key not in seen:
+                seen.add(key)
+                matched.append(r)
+    matched.sort(key=lambda r: (
+        _MACHINE_ENV_ORDER.get(str(r.get("environment") or "").upper(), 9),
+        str(r.get("belongs") or "").lower(),
+        str(r.get("name") or "").lower(),
+    ))
+    return matched, not_found
+
+
+def _machine_online_emoji(online: str) -> tuple[str, str]:
+    s = " ".join((online or "").lower().split())
+    if "offline" in s:
+        return "🔴", "Offline"
+    if "online" in s:
+        return "🟢", "Online"
+    return "⚪", (online or "").strip() or "unknown"
+
+
+def _machine_status_emoji(status: str) -> str:
+    s = (status or "").lower()
+    if "maintain" in s:
+        return "🛠️"
+    if "normal" in s:
+        return "✅"
+    if "occupy" in s:
+        return "🎮"
+    return "❔"
+
+
+def _machine_row_md(r: dict[str, Any]) -> str:
+    on_emoji, on_label = _machine_online_emoji(str(r.get("online") or ""))
+    status = str(r.get("status") or "").strip() or "—"
+    bits = [
+        f"{on_emoji} **{str(r.get('name') or '—').strip()}** — {on_label}",
+        f"{_machine_status_emoji(status)} {status}",
+        str(r.get("belongs") or "—").strip() or "—",
+        str(r.get("game_type") or "—").strip() or "—",
+    ]
+    if r.get("is_test"):
+        bits.append("🧪 TEST")
+    return " · ".join(bits)
+
+
+def _machine_age_label(mtime: float) -> str:
+    age = max(0, int(time.time() - mtime))
+    if age < 120:
+        return f"{age}s ago"
+    if age < 7200:
+        return f"{age // 60} min ago"
+    if age < 172800:
+        return f"{age // 3600} h ago"
+    return f"{age // 86400} d ago"
+
+
+def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
+                  mtime: float, truncated: int) -> dict[str, Any]:
+    onls = [str(r.get("online") or "").lower() for r in matched]
+    if matched and not not_found and all("online" in s and "offline" not in s for s in onls):
+        template = "green"
+    elif not matched or any("offline" in s for s in onls):
+        template = "red"
+    else:
+        template = "orange"
+    title = f"🎰 Machine status — {len(matched)} found"
+    if not_found:
+        title += f", {len(not_found)} not found"
+    elements: list[dict[str, Any]] = []
+    by_env: dict[str, list[str]] = {}
+    for r in matched:
+        env = str(r.get("environment") or "PROD").strip().upper() or "PROD"
+        by_env.setdefault(env, []).append(_machine_row_md(r))
+    for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
+        elements.append({"tag": "markdown",
+                         "content": f"**{env}**\n" + "\n".join(by_env[env])})
+    if truncated > 0:
+        elements.append({"tag": "markdown",
+                         "content": f"*… and {truncated} more matches not shown*"})
+    if not_found:
+        elements.append({"tag": "markdown",
+                         "content": "❓ **Not found:** " + ", ".join(not_found[:40])})
+    elements.append({"tag": "markdown",
+                     "content": f"*webmachine_data.json · updated {_machine_age_label(mtime)}*"})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title[:150]},
+            "template": template,
+        },
+        "elements": elements,
+    }
+
+
+def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
+    tokens = [w for w in re.split(r"[\s,;，；]+", (arg or "").strip()) if w]
+    if not tokens:
+        reply_text(chat_id, message_id, _MACHINE_USAGE)
+        return
+    rows, path, mtime = _machine_load_rows()
+    if not rows:
+        reply_text(
+            chat_id, message_id,
+            "⚠️ No machine data yet — the background scrape hasn't written "
+            f"`{os.path.basename(path)}`. It refreshes every "
+            f"{(os.environ.get('WEBMACHINE_SCRAPE_INTERVAL_SEC') or '900').strip() or '900'}s "
+            "after startup; try again in a few minutes (check WEBMACHINE_SCRAPE and the "
+            "backend logins in .env if it never appears).",
+        )
+        return
+    matched, not_found = _machine_match_rows(tokens, rows)
+    shown = matched[:_MACHINE_MATCH_CAP]
+    card = _machine_card(shown, not_found, mtime, truncated=len(matched) - len(shown))
+    reply_card(chat_id, message_id, card)
+
+
 def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -> None:
     """Pick the action for a message; ack with GotIt while working, Done after.
 
@@ -2476,6 +2655,8 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
         action = lambda: _do_csupdate(chat_id, message_id, t[len("/csupdate"):])
     elif low.startswith("/reply"):
         action = lambda: _do_reply(chat_id, message_id, t[len("/reply"):])
+    elif low.startswith("/machine"):
+        action = lambda: _do_machine(chat_id, message_id, t[len("/machine"):])
     elif low.startswith("/scan"):
         action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):
