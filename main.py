@@ -2112,13 +2112,13 @@ def _reply_batch_new(chat_id: str, specs: list[dict[str, Any]]) -> str:
     return batch_id
 
 
-def _reply_batch_claim(batch_id: str) -> Optional[dict[str, Any]]:
-    """Atomically move a batch pending→sending; None if unknown/already used."""
+def _reply_batch_claim(batch_id: str, new_state: str = "sending") -> Optional[dict[str, Any]]:
+    """Atomically move a batch pending→new_state; None if unknown/already used."""
     with _pending_replies_lock:
         b = _pending_replies.get(batch_id)
         if b is None or b["state"] != "pending":
             return None
-        b["state"] = "sending"
+        b["state"] = new_state
         return b
 
 
@@ -2145,7 +2145,7 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
     elements.append({"tag": "hr"})
     elements.append({"tag": "markdown", "content": (
         "**Each email will be sent as:**\n"
-        f"{_REPLY_GREETING}\n\n`<the content you type below>`\n\n{_REPLY_CLOSING}")})
+        f"{_REPLY_GREETING}\n\n*(the content you fill in below)*\n\n{_REPLY_CLOSING}")})
     elements.append({
         "tag": "form",
         "name": "reply_form",
@@ -2154,6 +2154,9 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 "tag": "input",
                 "name": "reply_content",
                 "required": True,
+                "input_type": "multiline_text",
+                "rows": 8,
+                "max_length": 5000,
                 "label": {"tag": "plain_text", "content": "Content"},
                 "placeholder": {"tag": "plain_text",
                                 "content": "Fill in the middle content of the reply…"},
@@ -2164,7 +2167,7 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 "name": "send_reply",
                 "text": {"tag": "plain_text", "content": f"📤 Send reply to all {n} email(s)"},
                 "type": "primary",
-                "value": {"batch": batch_id},
+                "value": {"batch": batch_id, "action": "send"},
                 "confirm": {
                     "title": {"tag": "plain_text", "content": "Send replies?"},
                     "text": {"tag": "plain_text",
@@ -2172,6 +2175,15 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 },
             },
         ],
+    })
+    elements.append({
+        "tag": "action",
+        "actions": [{
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "✖️ Cancel — send nothing"},
+            "type": "danger",
+            "value": {"batch": batch_id, "action": "cancel"},
+        }],
     })
     return {
         "config": {"wide_screen_mode": True},
@@ -2279,14 +2291,27 @@ def _send_reply_batch(batch: dict[str, Any], content: str) -> None:
     reply_text(batch["chat_id"], "", summary)
 
 
+def _reply_done_card(text: str, template: str) -> dict[str, Any]:
+    """Replacement card shown after Send/Cancel so the form disappears."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "✉️ Reply All"},
+                   "template": template},
+        "elements": [{"tag": "markdown", "content": text}],
+    }
+
+
 def _on_card_action(data):
-    """card.action.trigger over the persistent connection (form submit)."""
+    """card.action.trigger over the persistent connection (Send / Cancel)."""
     from lark_oapi.event.callback.model.p2_card_action_trigger import (
         P2CardActionTriggerResponse,
     )
 
-    def toast(kind: str, text: str):
-        return P2CardActionTriggerResponse({"toast": {"type": kind, "content": text}})
+    def respond(kind: str, text: str, card: Optional[dict[str, Any]] = None):
+        body: dict[str, Any] = {"toast": {"type": kind, "content": text}}
+        if card is not None:
+            body["card"] = {"type": "raw", "data": card}
+        return P2CardActionTriggerResponse(body)
 
     try:
         action = getattr(data.event, "action", None)
@@ -2298,21 +2323,32 @@ def _on_card_action(data):
                 value = {}
         batch_id = str(value.get("batch") or "")
         if not batch_id:
-            return toast("info", "Nothing to do")
+            return respond("info", "Nothing to do")
+        act = str(value.get("action") or "send")
+        if act == "cancel":
+            batch = _reply_batch_claim(batch_id, "cancelled")
+            if batch is None:
+                return respond("warning", "Already sent or cancelled")
+            return respond("success", "Cancelled — nothing was sent",
+                           _reply_done_card("❌ **Cancelled** — no email was sent.", "red"))
         form = getattr(action, "form_value", None) or {}
         if not isinstance(form, dict):
             form = {}
         content = str(form.get("reply_content") or "").strip()
         if not content:
-            return toast("error", "Please fill in the content first")
+            return respond("error", "Please fill in the content first")
         batch = _reply_batch_claim(batch_id)
         if batch is None:
-            return toast("warning", "This reply was already sent (or expired) — run /reply again")
+            return respond("warning", "This reply was already sent (or expired) — run /reply again")
         threading.Thread(target=_send_reply_batch, args=(batch, content), daemon=True).start()
-        return toast("success", f"Sending {len(batch['specs'])} repl(y/ies)…")
+        n = len(batch["specs"])
+        return respond("success", f"Sending {n} repl(y/ies)…",
+                       _reply_done_card(
+                           f"📤 **Sending {n} repl(y/ies)…** — the result summary "
+                           "will be posted in this chat.", "green"))
     except Exception as ex:
         print(f"[reply] card action failed: {ex!r}", flush=True)
-        return toast("error", "Failed — check the bot logs")
+        return respond("error", "Failed — check the bot logs")
 
 
 # ===================== Command router =====================
