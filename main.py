@@ -545,9 +545,14 @@ def extract_body_text(msg: email.message.Message) -> str:
 
 
 def _addr_list(raw: str) -> list[str]:
-    """Addresses from a header value. Semicolon separators (Outlook/Lark style)
-    make getaddresses return nothing — normalize them to commas first."""
-    return [a for _n, a in getaddresses([(raw or "").replace(";", ",")]) if a and "@" in a]
+    """Addresses from a header value.
+
+    Real-world headers break getaddresses two ways: semicolon separators
+    (Outlook/Lark style) parse to nothing, and folded headers with CR+LF
+    continuations ("…\\r\\n <a@b>") parse to garbage. Normalize whitespace runs
+    to single spaces and semicolons to commas before parsing."""
+    flat = re.sub(r"\s+", " ", raw or "").replace(";", ",")
+    return [a for _n, a in getaddresses([flat]) if a and "@" in a]
 
 
 def message_to_entry(msg: email.message.Message, *, folder: str, uid: str,
