@@ -1,3 +1,4 @@
 lark-oapi
 python-dotenv
 requests
+playwright  # machine scrape (webmachine.py/smmachine.py); then run: playwright install chromium

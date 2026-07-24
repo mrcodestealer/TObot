@@ -45,6 +45,26 @@ Typical flow: `/search evolution maintenance` → pick from the listing →
   set: *Event subscriptions → Receive events through persistent connection*
   and subscribe to `im.message.receive_v1`.
 
+## Machine scrape (copied from machine bot)
+
+`webmachine.py` + `smmachine.py` + `checkcredit.py` are trimmed copies of the
+machine bot's read-only scrape: a **warm browser pool** keeps one logged-in
+Chromium open per backend/environment, a background loop walks **every machine
+in every environment** (PROD via `*_BACKEND_*` logins; QAT/UAT via
+`*.osmslot.org`) every `WEBMACHINE_SCRAPE_INTERVAL_SEC` (default 15 min), and
+stores the rows to **`webmachine_data.json`**. It starts automatically with
+`main.py`; requires `pip install playwright && playwright install chromium`
+plus the backend logins in `.env` (see `.env.example`), and can be disabled
+with `WEBMACHINE_SCRAPE=0` / kept one-shot with `WEBMACHINE_WARM_POOL=0`.
+
+On a **server without a display** (the systemd deploy) set
+`WEBMACHINE_WARM_HEADLESS=1` — warm-pool browsers are *headed* by default and
+headed Chromium cannot start without an X server, so every scrape pass would
+fail (and rewrite the JSON as `[]`). Note `BOT_PLAYWRIGHT_HEADLESS=1` covers
+only one-shot scrapes, not the warm pool. If TObot and the machine bot ever
+run warm pools on the same host they collide on the shared
+`$TMPDIR/wm_warm_profile_*` Chromium profiles — keep only one bot's pool on.
+
 ## Local run
 
 ```bash
@@ -62,6 +82,8 @@ cd TObot
 pip3 install -r requirements.txt
 # If pip refuses with "externally-managed-environment" (Ubuntu 23+/Debian 12+):
 #   pip3 install --break-system-packages -r requirements.txt
+playwright install chromium       # browser for the machine scrape
+playwright install-deps chromium  # Chromium shared libs (Debian/Ubuntu)
 nano .env                        # paste the real .env (not in git)
 cp tobot.service /etc/systemd/system/tobot.service
 systemctl daemon-reload

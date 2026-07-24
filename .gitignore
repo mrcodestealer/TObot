@@ -4,6 +4,8 @@
 # Runtime state
 allemail.json
 allemail.json.*.tmp
+webmachine_data.json
+wm_warm_profile_*/
 *.log
 
 # Python

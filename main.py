@@ -2748,6 +2748,22 @@ def main() -> int:
         flush=True,
     )
     threading.Thread(target=_scanner_daemon, daemon=True, name="scanner").start()
+    # Machine scrape (copied from machine bot): warm browser per backend/environment,
+    # walks every machine in PROD/QAT/UAT and stores webmachine_data.json.
+    # SystemExit included: smmachine raises it for a bad WEBMACHINE_SITES alias,
+    # and a scrape-config typo must not take down the email bot.
+    try:
+        import webmachine as _wm
+
+        _wm.start_background_scrape_loop()
+    except (Exception, SystemExit) as ex:
+        print(f"[webmachine] scrape loop not started: {ex!r}", flush=True)
+    try:
+        import smmachine as _boot_wm
+
+        _boot_wm.prewarm_webmachine_scrape_pool_on_startup()
+    except (Exception, SystemExit) as ex:
+        print(f"[webmachine] warm pool prewarm skipped: {ex!r}", flush=True)
     run_ws_forever()
     return 0
 
