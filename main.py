@@ -2171,9 +2171,7 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
             f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*",
         ])))
     elements.append({"tag": "hr"})
-    elements.append(_md(
-        "**Each email will be sent as:**\n"
-        f"{_REPLY_GREETING}\n\n*(the content you fill in below)*\n\n{_REPLY_CLOSING}"))
+    elements.append(_md("**Edit the reply below — it is sent exactly as shown:**"))
     elements.append({
         "tag": "form",
         "name": "reply_form",
@@ -2187,10 +2185,13 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 "width": "fill",
                 "label": {"tag": "plain_text", "content": "Content"},
                 "label_position": "top",
+                # Template pre-filled in the box; the user edits it in place.
+                "default_value": f"{_REPLY_GREETING}\n\n\n\n{_REPLY_CLOSING}",
                 "placeholder": {"tag": "plain_text",
-                                "content": "Fill in the middle content of the reply…"},
+                                "content": "Write the reply content…"},
                 "required": True,
-                # Lark rejects anything above its default maximum of 1000.
+                # Lark rejects anything above its default maximum of 1000
+                # (default_value must stay within it too — cf. osedutybot).
                 "max_length": 1000,
             },
             {
@@ -2296,7 +2297,8 @@ def send_reply_email(spec: dict[str, Any], content: str) -> None:
         msg["In-Reply-To"] = spec["in_reply_to"]
     if spec.get("references"):
         msg["References"] = spec["references"]
-    msg.set_content(f"{_REPLY_GREETING}\n\n{content.strip()}\n\n{_REPLY_CLOSING}\n")
+    # The card's text box holds the WHOLE body (template pre-filled) — send as-is.
+    msg.set_content(content.strip() + "\n")
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, context=ctx, timeout=60) as smtp:
         smtp.login(MAIL_USER, MAIL_PASSWORD)
