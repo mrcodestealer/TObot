@@ -16,6 +16,7 @@ Lark chat.
 | `/csupdate` + one email title per line | AI review of the **whole thread** (qwen): reads every message **and its images**, explains the issue, the solution if present, the current status, and flags `⚠️ NEEDS UPDATE` when the newest message is ≥2 days old and unresolved |
 | `/searchwithai` + one email title per line | AI review of the **latest message only** (qwen): faster — summary, status, and freshness of just the newest email in each thread |
 | `/searchwithoutai` + one email title per line | Just the **latest message** (sender + content + images), **no AI** — the quick "what's the newest reply" view |
+| `/reply` + one email title per line | All-or-nothing reply-all: every title must be found, then ONE card shows each thread's own To/Cc (reply-all to its latest message) with an input box — fill in one content, press **Send**, and each thread gets the reply with its own recipients. Sent from `om@` via SMTP with proper threading (In-Reply-To/References) |
 | `/scan` | Force an immediate mailbox re-scan |
 | `/status` | Index size, retention window, last scan (per folder) |
 | `/help` | Help |

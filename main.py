@@ -41,8 +41,10 @@ import io
 import json
 import os
 import re
+import smtplib
 import ssl
 import sys
+import uuid
 import threading
 import time
 from collections import OrderedDict
@@ -84,6 +86,9 @@ MAIL_IMAP_SSL = _env("MAIL_IMAP_SSL", "MAINTENANCE_MAIL_IMAP_SSL", default="1").
     "0", "false", "no", "off",
 )
 MAIL_TZ = _env("TOBOT_TZ", "MAINTENANCE_MAIL_TZ", default="Asia/Manila")
+# Outgoing replies (/reply) — same account as IMAP unless overridden.
+MAIL_SMTP_HOST = _env("MAIL_SMTP_HOST", "MAINTENANCE_MAIL_SMTP_HOST", default="smtp.larksuite.com")
+MAIL_SMTP_PORT = int(_env("MAIL_SMTP_PORT", "MAINTENANCE_MAIL_SMTP_PORT", default="465"))
 
 # ===================== Index tuning =====================
 STORE_PATH = os.path.join(_ROOT, "allemail.json")
@@ -2023,6 +2028,293 @@ def _do_searchwithoutai(chat_id: str, message_id: str, arg: str) -> None:
             reply_text(chat_id, message_id, _format_details(withbody))
 
 
+# ===================== /reply — reply-all with card form =====================
+# Flow: "/reply\n<title>\n<title>" → every title must resolve; ONE preview card
+# lists each thread's own To/Cc (reply-all to its LATEST message) with an input
+# box + Send button. Submitting sends the SAME content to every thread — each
+# with its own recipients/threading. Nothing is sent until the button is pressed.
+_REPLY_GREETING = "Hi team,"
+_REPLY_CLOSING = "Thank you and best regards,"
+_REPLY_BATCH_TTL_SEC = 24 * 3600
+_REPLY_BATCH_MAX = 20
+
+_pending_replies: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_pending_replies_lock = threading.Lock()
+
+
+def _own_addresses() -> set[str]:
+    return {a.strip().casefold() for a in (MAIL_USER,) if a.strip()}
+
+
+def _reply_subject(subject: str) -> str:
+    s = (subject or "").strip()
+    return s if re.match(r"^\s*re\s*[::]", s, re.I) else f"Re: {s}"
+
+
+def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
+                        entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Reply-all spec for one thread, from its LATEST message.
+
+    To = latest sender + its To recipients; Cc = its Cc — own address removed,
+    order kept, deduped. Uses the live message when fetchable (accurate headers
+    + References for threading), falling back to the indexed headers.
+    """
+    latest = entries[-1]
+    frm = list(latest.get("from") or [])
+    to = list(latest.get("to") or [])
+    cc = list(latest.get("cc") or [])
+    references = ""
+    msg = _fetch_content_for_entry(mail, latest) if mail is not None else None
+    if msg is not None:
+        frm = [a for _n, a in getaddresses([msg.get("From") or ""]) if a and "@" in a] or frm
+        to = [a for _n, a in getaddresses([msg.get("To") or ""]) if a and "@" in a] or to
+        cc = [a for _n, a in getaddresses([msg.get("Cc") or ""]) if a and "@" in a]
+        references = re.sub(r"\s+", " ", msg.get("References") or "").strip()
+    own = _own_addresses()
+    to_out: list[str] = []
+    seen: set[str] = set()
+    for a in frm + to:
+        al = a.strip().casefold()
+        if al and al not in own and al not in seen:
+            seen.add(al)
+            to_out.append(a.strip())
+    cc_out: list[str] = []
+    for a in cc:
+        al = a.strip().casefold()
+        if al and al not in own and al not in seen:
+            seen.add(al)
+            cc_out.append(a.strip())
+    mid = (latest.get("message_id") or "").strip()
+    return {
+        "title": entries[0].get("subject") or latest.get("subject") or "",
+        "subject": _reply_subject(latest.get("subject") or ""),
+        "to": to_out,
+        "cc": cc_out,
+        "in_reply_to": mid,
+        "references": (f"{references} {mid}".strip() if mid else references),
+        "latest_from": latest.get("from_raw") or ", ".join(frm) or "?",
+        "latest_date": _fmt_date(latest),
+    }
+
+
+def _reply_batch_new(chat_id: str, specs: list[dict[str, Any]]) -> str:
+    batch_id = uuid.uuid4().hex[:12]
+    with _pending_replies_lock:
+        now = time.time()
+        for k in list(_pending_replies):
+            if now - _pending_replies[k]["created"] > _REPLY_BATCH_TTL_SEC:
+                del _pending_replies[k]
+        while len(_pending_replies) >= _REPLY_BATCH_MAX:
+            _pending_replies.popitem(last=False)
+        _pending_replies[batch_id] = {
+            "chat_id": chat_id, "specs": specs, "created": now, "state": "pending",
+        }
+    return batch_id
+
+
+def _reply_batch_claim(batch_id: str) -> Optional[dict[str, Any]]:
+    """Atomically move a batch pending→sending; None if unknown/already used."""
+    with _pending_replies_lock:
+        b = _pending_replies.get(batch_id)
+        if b is None or b["state"] != "pending":
+            return None
+        b["state"] = "sending"
+        return b
+
+
+def _esc_addrs(addrs: list[str]) -> str:
+    return ", ".join(addrs).replace("<", "‹").replace(">", "›") or "(none)"
+
+
+def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str, Any]:
+    n = len(specs)
+    elements: list[dict[str, Any]] = [{
+        "tag": "markdown",
+        "content": (f"✅ **All {n} email(s) found.** The same content will be sent to "
+                    "each thread — every reply uses ITS OWN recipients "
+                    "(reply-all to that thread's latest message):"),
+    }]
+    for i, s in enumerate(specs, 1):
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "markdown", "content": "\n".join([
+            f"**#{i} {s['title']}**",
+            f"**To:** {_esc_addrs(s['to'])}",
+            f"**Cc:** {_esc_addrs(s['cc'])}",
+            f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*",
+        ])})
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "markdown", "content": (
+        "**Each email will be sent as:**\n"
+        f"{_REPLY_GREETING}\n\n`<the content you type below>`\n\n{_REPLY_CLOSING}")})
+    elements.append({
+        "tag": "form",
+        "name": "reply_form",
+        "elements": [
+            {
+                "tag": "input",
+                "name": "reply_content",
+                "required": True,
+                "label": {"tag": "plain_text", "content": "Content"},
+                "placeholder": {"tag": "plain_text",
+                                "content": "Fill in the middle content of the reply…"},
+            },
+            {
+                "tag": "button",
+                "action_type": "form_submit",
+                "name": "send_reply",
+                "text": {"tag": "plain_text", "content": f"📤 Send reply to all {n} email(s)"},
+                "type": "primary",
+                "value": {"batch": batch_id},
+                "confirm": {
+                    "title": {"tag": "plain_text", "content": "Send replies?"},
+                    "text": {"tag": "plain_text",
+                             "content": f"This sends {n} real email(s) from {MAIL_USER}."},
+                },
+            },
+        ],
+    })
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text",
+                      "content": f"✉️ Reply All — {n} email(s) ready"[:150]},
+            "template": "green",
+        },
+        "elements": elements,
+    }
+
+
+def _do_reply(chat_id: str, message_id: str, arg: str) -> None:
+    titles = _parse_csupdate_titles(arg)
+    if not titles:
+        reply_text(chat_id, message_id,
+                   "Usage:\n/reply\n<email title 1>\n<email title 2>\n…\n"
+                   "Finds every email, shows each one's reply-all To/Cc in a card, "
+                   "and lets you fill in ONE content that is sent to all of them.")
+        return
+    try:
+        mail = _connect_imap()
+    except Exception as ex:
+        print(f"[reply] IMAP connect failed: {ex!r}", flush=True)
+        mail = None
+    specs: list[dict[str, Any]] = []
+    missing: list[str] = []
+    no_recipients: list[str] = []
+    try:
+        for title in titles:
+            entries = _resolve_thread(title)
+            if not entries:
+                missing.append(title)
+                continue
+            try:
+                spec = _compute_reply_spec(mail, entries)
+            except ImapStaleConnectionError:
+                try:
+                    mail = _connect_imap()
+                except Exception:
+                    mail = None
+                spec = _compute_reply_spec(mail, entries)
+            if not spec["to"]:
+                no_recipients.append(title)
+                continue
+            specs.append(spec)
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+    if missing or no_recipients:
+        lines = ["❌ Not every email was found — nothing prepared, nothing will be sent."]
+        for t in titles:
+            if t in missing:
+                lines.append(f"  ❌ {t} — not found (check with /search)")
+            elif t in no_recipients:
+                lines.append(f"  ⚠️ {t} — found, but no reply recipients besides {MAIL_USER}")
+            else:
+                lines.append(f"  ✅ {t}")
+        reply_text(chat_id, message_id, "\n".join(lines))
+        return
+    batch_id = _reply_batch_new(chat_id, specs)
+    if not reply_card(chat_id, message_id, _reply_preview_card(batch_id, specs)):
+        reply_text(chat_id, message_id,
+                   "❌ Couldn't render the reply card (check bot card permissions) — "
+                   "nothing was sent.")
+
+
+def send_reply_email(spec: dict[str, Any], content: str) -> None:
+    """One SMTP reply-all send. Raises on failure."""
+    msg = email.message.EmailMessage()
+    msg["From"] = MAIL_USER
+    msg["To"] = ", ".join(spec["to"])
+    if spec["cc"]:
+        msg["Cc"] = ", ".join(spec["cc"])
+    msg["Subject"] = spec["subject"]
+    if spec.get("in_reply_to"):
+        msg["In-Reply-To"] = spec["in_reply_to"]
+    if spec.get("references"):
+        msg["References"] = spec["references"]
+    msg.set_content(f"{_REPLY_GREETING}\n\n{content.strip()}\n\n{_REPLY_CLOSING}\n")
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, context=ctx, timeout=60) as smtp:
+        smtp.login(MAIL_USER, MAIL_PASSWORD)
+        smtp.send_message(msg)
+
+
+def _send_reply_batch(batch: dict[str, Any], content: str) -> None:
+    """Background worker: send every reply, then report results to the chat."""
+    results: list[str] = []
+    ok_count = 0
+    for s in batch["specs"]:
+        try:
+            send_reply_email(s, content)
+            ok_count += 1
+            results.append(f"  ✅ {s['title']}")
+        except Exception as ex:
+            print(f"[reply] send failed for {s['title']!r}: {ex!r}", flush=True)
+            results.append(f"  ❌ {s['title']} — {ex!r}")
+    batch["state"] = "sent"
+    summary = (f"📤 Reply sent to {ok_count}/{len(batch['specs'])} email(s) "
+               f"from {MAIL_USER}:\n" + "\n".join(results))
+    reply_text(batch["chat_id"], "", summary)
+
+
+def _on_card_action(data):
+    """card.action.trigger over the persistent connection (form submit)."""
+    from lark_oapi.event.callback.model.p2_card_action_trigger import (
+        P2CardActionTriggerResponse,
+    )
+
+    def toast(kind: str, text: str):
+        return P2CardActionTriggerResponse({"toast": {"type": kind, "content": text}})
+
+    try:
+        action = getattr(data.event, "action", None)
+        value = getattr(action, "value", None) or {}
+        if not isinstance(value, dict):
+            try:
+                value = json.loads(str(value))
+            except Exception:
+                value = {}
+        batch_id = str(value.get("batch") or "")
+        if not batch_id:
+            return toast("info", "Nothing to do")
+        form = getattr(action, "form_value", None) or {}
+        if not isinstance(form, dict):
+            form = {}
+        content = str(form.get("reply_content") or "").strip()
+        if not content:
+            return toast("error", "Please fill in the content first")
+        batch = _reply_batch_claim(batch_id)
+        if batch is None:
+            return toast("warning", "This reply was already sent (or expired) — run /reply again")
+        threading.Thread(target=_send_reply_batch, args=(batch, content), daemon=True).start()
+        return toast("success", f"Sending {len(batch['specs'])} repl(y/ies)…")
+    except Exception as ex:
+        print(f"[reply] card action failed: {ex!r}", flush=True)
+        return toast("error", "Failed — check the bot logs")
+
+
 # ===================== Command router =====================
 HELP_TEXT = (
     "TObot — email search bot 📮\n"
@@ -2040,6 +2332,8 @@ HELP_TEXT = (
     "  of each and summarizes it (faster than /csupdate)\n"
     "/searchwithoutai + one email title per line — shows just the LATEST message\n"
     "  (content + images), no AI\n"
+    "/reply + one email title per line — shows every email's reply-all To/Cc in\n"
+    "  a card; fill in ONE content and press Send to reply-all to each of them\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2110,6 +2404,8 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
         action = lambda: _search_and_reply(chat_id, message_id, t[len("/search"):])
     elif low.startswith("/csupdate"):
         action = lambda: _do_csupdate(chat_id, message_id, t[len("/csupdate"):])
+    elif low.startswith("/reply"):
+        action = lambda: _do_reply(chat_id, message_id, t[len("/reply"):])
     elif low.startswith("/scan"):
         action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):
@@ -2341,6 +2637,7 @@ def run_ws_forever() -> None:
     handler = (
         lark.EventDispatcherHandler.builder("", "")
         .register_p2_im_message_receive_v1(_on_message)
+        .register_p2_card_action_trigger(_on_card_action)
         .build()
     )
     domain_name = _env("LARK_DOMAIN", default="lark").lower()
