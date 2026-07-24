@@ -102,6 +102,24 @@ CARD_CHARS_BUDGET = max(4000, int(_env("TOBOT_CARD_CHARS", default="18000")))
 # Recently fetched contents kept in memory so re-opening an email is instant.
 BODY_CACHE_MAX = max(20, int(_env("TOBOT_BODY_CACHE_MAX", default="300")))
 
+# ===================== /csupdate — AI thread review =====================
+# qwen (via the local Ollama OpenAI endpoint) reads a whole email thread —
+# images included — and explains the issue, the solution, the current status,
+# and whether the thread is stale and needs a follow-up.
+CSUPDATE_MODEL = _env("CSUPDATE_MODEL", "BOT_CHAT_MODEL", default="qwen3.6:35b-a3b")
+CSUPDATE_API_BASE = _env("CSUPDATE_API_BASE", "BOT_CHAT_API_BASE",
+                         default="http://127.0.0.1:11434/v1").rstrip("/")
+CSUPDATE_API_KEY = _env("CSUPDATE_API_KEY", "BOT_CHAT_API_KEY", default="ollama")
+CSUPDATE_TIMEOUT = max(30, int(_env("CSUPDATE_TIMEOUT", default="600")))
+# qwen3.6 on this server needs reasoning_effort=none (see osedutybot /pldtprefix);
+# set CSUPDATE_REASONING=off to omit the field entirely.
+CSUPDATE_REASONING = _env("CSUPDATE_REASONING", default="none")
+CSUPDATE_STALE_DAYS = max(1, int(_env("CSUPDATE_STALE_DAYS", default="2")))
+CSUPDATE_MAX_THREADS = max(1, int(_env("CSUPDATE_MAX_THREADS", default="5")))
+CSUPDATE_MAX_IMAGES = max(0, int(_env("CSUPDATE_MAX_IMAGES", default="4")))
+CSUPDATE_CHARS_PER_MAIL = max(500, int(_env("CSUPDATE_CHARS_PER_MAIL", default="4000")))
+CSUPDATE_TOTAL_CHARS = max(2000, int(_env("CSUPDATE_TOTAL_CHARS", default="24000")))
+
 # Inline images: extract from the email, upload to Lark, embed in the card.
 SHOW_IMAGES = _env("TOBOT_SHOW_IMAGES", default="1").lower() not in ("0", "false", "no", "off")
 IMAGES_PER_EMAIL = max(0, int(_env("TOBOT_IMAGES_PER_EMAIL", default="8")))
@@ -1520,6 +1538,236 @@ def _search_and_reply(chat_id: str, message_id: str, query: str) -> None:
             break
 
 
+# ===================== /csupdate — AI thread review =====================
+_THINK_RE = re.compile(r"<think>.*?</think>", re.S)
+
+
+def _strip_think(s: str) -> str:
+    return _THINK_RE.sub("", s or "").strip()
+
+
+def _llm_chat(messages: list[dict[str, Any]]) -> str:
+    """One chat completion against the local OpenAI-compatible endpoint."""
+    payload: dict[str, Any] = {
+        "model": CSUPDATE_MODEL,
+        "messages": messages,
+        "stream": False,
+    }
+    if CSUPDATE_REASONING and CSUPDATE_REASONING.lower() != "off":
+        payload["reasoning_effort"] = CSUPDATE_REASONING
+    resp = requests.post(
+        f"{CSUPDATE_API_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {CSUPDATE_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=payload,
+        timeout=CSUPDATE_TIMEOUT,
+    )
+    data = resp.json()
+    if resp.status_code != 200 or data.get("error"):
+        raise RuntimeError(f"LLM error {resp.status_code}: {str(data)[:300]}")
+    content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    return _strip_think(content)
+
+
+def _parse_csupdate_titles(arg: str) -> list[str]:
+    out: list[str] = []
+    for ln in (arg or "").splitlines():
+        t = ln.strip().strip('"').strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _days_since_ts(ts: float) -> int:
+    if ts <= 0:
+        return 0
+    tz = _local_tz()
+    return max(0, (datetime.now(tz).date() - datetime.fromtimestamp(ts, tz).date()).days)
+
+
+def _resolve_thread(title: str) -> list[dict[str, Any]]:
+    """Title (or Message-ID) → the whole thread's entries, oldest first."""
+    exact, results, exact_title, _total = _search_entries(title)
+    if exact is not None:
+        # Message-ID given — expand to its thread via the subject.
+        _e2, r2, et2, _t2 = _search_entries(exact.get("subject") or "")
+        return r2 if et2 and r2 else [exact]
+    if exact_title:
+        return results
+    if results:
+        best = results[0]
+        _e2, r2, et2, _t2 = _search_entries(best.get("subject") or "")
+        return r2 if et2 and r2 else [best]
+    return []
+
+
+def _build_csupdate_prompt(title: str, mails: list[dict[str, Any]],
+                           days_old: int, image_count: int) -> tuple[str, str]:
+    """(system_prompt, user_text) for one thread review.
+
+    ``mails``: [{"from":…, "date":…, "text":…}, …] oldest→newest.
+    """
+    tz = MAIL_TZ
+    today = datetime.now(_local_tz()).strftime("%Y-%m-%d")
+    last_date = mails[-1]["date"] if mails else "?"
+    system = (
+        "You are an operations assistant reviewing an internal email thread for the duty team. "
+        f"Today is {today} ({tz}). Answer concisely in short sections:\n"
+        "1. ISSUE — what this email thread is about (who reported what).\n"
+        "2. SOLUTION — the fix/answer/conclusion if any message contains one; otherwise say none was given yet.\n"
+        "3. STATUS — current state (resolved / waiting on someone / ongoing) and who the ball is with.\n"
+        "4. UPDATE CHECK — the newest message is "
+        f"{days_old} day(s) old (sent {last_date}, today {today}). "
+        f"If it is {CSUPDATE_STALE_DAYS} or more days old AND the thread is not clearly resolved, "
+        "start this section with '⚠️ NEEDS UPDATE' and say a follow-up should be sent; "
+        "otherwise say the thread is up to date or resolved.\n"
+        "If screenshots/images are attached, use them to understand the issue better and mention "
+        "anything important you see in them. Do not invent facts not present in the thread."
+    )
+    parts = [f'Email thread: "{title}" — {len(mails)} message(s), oldest first.']
+    if image_count:
+        parts.append(f"({image_count} image(s) from the thread are attached after the text.)")
+    budget = CSUPDATE_TOTAL_CHARS
+    for i, m in enumerate(mails, 1):
+        text = (m.get("text") or "").strip() or "(no text content)"
+        if len(text) > CSUPDATE_CHARS_PER_MAIL:
+            text = text[:CSUPDATE_CHARS_PER_MAIL].rstrip() + " …(trimmed)"
+        block = f"\n[#{i}] From: {m.get('from') or '?'} | Date: {m.get('date') or '?'}\n{text}"
+        if budget - len(block) < 0 and i < len(mails):
+            parts.append(f"\n…({len(mails) - i + 1} older message(s) omitted for length)")
+            break
+        parts.append(block)
+        budget -= len(block)
+    return system, "\n".join(parts)
+
+
+def _image_data_uri(mime: str, data: bytes) -> str:
+    return f"data:{mime or 'image/png'};base64," + base64.b64encode(data).decode()
+
+
+def _csupdate_review_one(mail: Optional[imaplib.IMAP4], title: str) -> tuple[str, str]:
+    """(thread_title, analysis_text) — raises on hard failures."""
+    entries = _resolve_thread(title)
+    if not entries:
+        return title, (f"No email found for “{title}” in the last {WINDOW_DAYS} days — "
+                       "check the title with /search first.")
+    mails: list[dict[str, Any]] = []
+    images: list[tuple[str, bytes]] = []
+    for e in entries:
+        text = ""
+        msg = _fetch_content_for_entry(mail, e) if mail is not None else None
+        if msg is not None:
+            text, imgs = extract_email_parts(msg)
+            images.extend(imgs)
+        if HIDE_QUOTED_HISTORY:
+            stripped = strip_quoted_history(text)
+            text = stripped or text
+        mails.append({
+            "from": e.get("from_raw") or ", ".join(e.get("from") or []) or "?",
+            "date": _fmt_date(e),
+            "text": text,
+        })
+    days_old = _days_since_ts(float(entries[-1].get("date_ts") or 0.0))
+    # Prefer big images (screenshots) over signature logos; dedupe by content.
+    seen_h: set[str] = set()
+    uniq: list[tuple[str, bytes]] = []
+    for mime, data in sorted(images, key=lambda t: len(t[1]), reverse=True):
+        if not data or len(data) < IMAGE_MIN_BYTES:
+            continue
+        h = hashlib.sha256(data).hexdigest()
+        if h in seen_h:
+            continue
+        seen_h.add(h)
+        uniq.append((mime, data))
+        if len(uniq) >= CSUPDATE_MAX_IMAGES:
+            break
+    system, user_text = _build_csupdate_prompt(
+        entries[0].get("subject") or title, mails, days_old, len(uniq))
+    content: Any = user_text
+    if uniq:
+        content = [{"type": "text", "text": user_text}] + [
+            {"type": "image_url", "image_url": {"url": _image_data_uri(m, d)}}
+            for m, d in uniq
+        ]
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": content}]
+    try:
+        analysis = _llm_chat(messages)
+    except Exception as ex:
+        if uniq:
+            # Model may not accept images — retry text-only.
+            print(f"[csupdate] retrying without images: {ex!r}", flush=True)
+            analysis = _llm_chat([{"role": "system", "content": system},
+                                  {"role": "user", "content": user_text}])
+            analysis += "\n\n_(note: the model could not view the attached images)_"
+        else:
+            raise
+    if not analysis.strip():
+        raise RuntimeError("LLM returned an empty answer")
+    return entries[0].get("subject") or title, analysis.strip()
+
+
+def _csupdate_card(title: str, analysis: str) -> dict[str, Any]:
+    elements = [{"tag": "markdown", "content": piece}
+                for piece in _split_body(analysis, CARD_CHARS_BUDGET)]
+    elements.append({"tag": "markdown",
+                     "content": f"*AI review by {CSUPDATE_MODEL} — verify before replying to the thread.*"})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"🤖 {title}"[:150]},
+            "template": "purple",
+        },
+        "elements": elements,
+    }
+
+
+def _do_csupdate(chat_id: str, message_id: str, arg: str) -> None:
+    titles = _parse_csupdate_titles(arg)
+    if not titles:
+        reply_text(chat_id, message_id,
+                   "Usage:\n/csupdate\n<email title 1>\n<email title 2>\n…\n"
+                   "Each title gets an AI review: issue, solution, status, and "
+                   "whether the thread needs a follow-up.")
+        return
+    dropped = 0
+    if len(titles) > CSUPDATE_MAX_THREADS:
+        dropped = len(titles) - CSUPDATE_MAX_THREADS
+        titles = titles[:CSUPDATE_MAX_THREADS]
+    note = f" (first {CSUPDATE_MAX_THREADS} only — {dropped} skipped)" if dropped else ""
+    reply_text(chat_id, message_id,
+               f"🤖 Reviewing {len(titles)} thread(s) with {CSUPDATE_MODEL}{note} — "
+               "this can take a few minutes per thread…")
+    try:
+        mail = _connect_imap()
+    except Exception as ex:
+        print(f"[csupdate] IMAP connect failed: {ex!r}", flush=True)
+        mail = None
+    try:
+        for title in titles:
+            try:
+                shown_title, analysis = _csupdate_review_one(mail, title)
+            except ImapStaleConnectionError as ex:
+                print(f"[csupdate] {ex} — reconnecting", flush=True)
+                try:
+                    mail = _connect_imap()
+                    shown_title, analysis = _csupdate_review_one(mail, title)
+                except Exception as ex2:
+                    reply_text(chat_id, message_id, f"❌ “{title}”: {ex2!r}")
+                    continue
+            except Exception as ex:
+                reply_text(chat_id, message_id, f"❌ “{title}”: {ex!r}")
+                continue
+            if not reply_card(chat_id, message_id, _csupdate_card(shown_title, analysis)):
+                reply_text(chat_id, message_id, f"🤖 {shown_title}\n──────────\n{analysis}")
+    finally:
+        if mail is not None:
+            try:
+                mail.logout()
+            except Exception:
+                pass
+
+
 # ===================== Command router =====================
 HELP_TEXT = (
     "TObot — email search bot 📮\n"
@@ -1531,6 +1779,8 @@ HELP_TEXT = (
     "/search <Message-ID> — direct exact lookup (the accurate key)\n"
     "/search <No.> — open result N from your last search listing\n"
     "@TObot <email title> — same as /search (in P2P just type the title)\n"
+    "/csupdate + one email title per line — AI reads each thread (images too)\n"
+    "  and explains the issue, solution, status, and if it NEEDS UPDATE\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -1593,6 +1843,8 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
     action = None
     if low.startswith("/search"):
         action = lambda: _search_and_reply(chat_id, message_id, t[len("/search"):])
+    elif low.startswith("/csupdate"):
+        action = lambda: _do_csupdate(chat_id, message_id, t[len("/csupdate"):])
     elif low.startswith("/scan"):
         action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):

@@ -13,6 +13,7 @@ Lark chat.
 | `/search <Message-ID>` | Exact lookup (most accurate) — shows sender, To/Cc, date, folder and content |
 | `/search <No.>` | Open result N from your previous `/search` listing |
 | `@TObot <email title>` | Same as `/search` (in P2P chat just type the title) |
+| `/csupdate` + one email title per line | AI thread review (qwen): reads every message **and its images**, explains the issue, the solution if present, the current status, and flags `⚠️ NEEDS UPDATE` when the newest message is ≥2 days old and unresolved |
 | `/scan` | Force an immediate mailbox re-scan |
 | `/status` | Index size, retention window, last scan (per folder) |
 | `/help` | Help |
