@@ -986,23 +986,32 @@ def _fetch_uid_body(mail: imaplib.IMAP4, uid: str) -> Optional[email.message.Mes
     return None
 
 
-# At most this many folders are searched per entry on the Message-ID fallback
-# path, so one /search can't turn into hundreds of IMAP round-trips.
-LIVE_FETCH_FOLDER_CAP = max(2, int(_env("TOBOT_LIVE_FETCH_FOLDERS", default="6")))
+# At most this many folders are searched per entry on the fallback path, so
+# one /search can't turn into hundreds of IMAP round-trips.
+LIVE_FETCH_FOLDER_CAP = max(2, int(_env("TOBOT_LIVE_FETCH_FOLDERS", default="12")))
 
 
 def _search_folders_for_live_fetch(mail: imaplib.IMAP4, first: str) -> list[str]:
-    if SCAN_ALL_FOLDERS:
-        names = [
+    """Folders to hunt a moved email in: its recorded folder, then the indexed
+    folders, then EVERY other server folder (an email closed out of OSE Pending
+    typically lands in CLOSED EMAILS, which may not be indexed)."""
+    try:
+        server = [
             _imap_utf7_decode(raw)
             for raw in _imap_list_folder_names(mail)
             if _imap_utf7_decode(raw).casefold() not in IMAP_EXCLUDE
         ]
-    else:
-        names = list(IMAP_FOLDERS)
-    out = [first] if first else []
-    for n in names:
-        if n.casefold() != (first or "").casefold():
+    except ImapStaleConnectionError:
+        raise
+    except Exception:
+        server = []
+    ordered = ([first] if first else []) + \
+        ([] if SCAN_ALL_FOLDERS else list(IMAP_FOLDERS)) + server
+    seen: set[str] = set()
+    out: list[str] = []
+    for n in ordered:
+        if n and n.casefold() not in seen:
+            seen.add(n.casefold())
             out.append(n)
     return out[:LIVE_FETCH_FOLDER_CAP]
 
@@ -1017,6 +1026,46 @@ def _mid_search_needles(mid: str) -> list[str]:
         if cand and cand.strip("<>") and cand not in out:
             out.append(cand)
     return out
+
+
+def _subject_search_uids(mail: imaplib.IMAP4, subject: str) -> list[bytes]:
+    """UID SEARCH by subject (sanitized, ASCII-only — cf. osedutybot's
+    _uid_search_subject_variants for this same server). [] when unusable."""
+    needle = re.sub(r"\s+", " ", (subject or "")).replace('"', " ").replace("\\", " ").strip()
+    needle = needle[:200].strip()
+    if not needle:
+        return []
+    try:
+        needle.encode("ascii")
+    except UnicodeEncodeError:
+        return []   # non-ASCII subject needs charset-tagged SEARCH — skip
+    for crit in (f'(HEADER Subject "{needle}")', f'(SUBJECT "{needle}")'):
+        uids = _uid_search(mail, crit)
+        if uids:
+            return uids
+    return []
+
+
+def _entry_matches_message(e: dict[str, Any], msg: email.message.Message) -> bool:
+    """Same email? Base subject must match, Date within 10 min, sender same."""
+    if _base_subject(_decode_hdr(msg.get("Subject"))) != _base_subject(e.get("subject") or ""):
+        return False
+    want_ts = float(e.get("date_ts") or 0.0)
+    if want_ts > 0:
+        try:
+            dt = parsedate_to_datetime((msg.get("Date") or "").strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if abs(dt.timestamp() - want_ts) > 600:
+                return False
+        except Exception:
+            return False
+    want_from = ((e.get("from") or [""])[0] or "").casefold()
+    if want_from:
+        got_from = [a.casefold() for _n, a in getaddresses([msg.get("From") or ""]) if a]
+        if got_from and want_from not in got_from:
+            return False
+    return True
 
 
 def _fetch_content_for_entry(
@@ -1039,9 +1088,10 @@ def _fetch_content_for_entry(
     # Accurate path: find the email by its Message-ID wherever it lives now.
     # HEADER search is substring-based, so every hit is verified against the
     # exact Message-ID before its content is accepted (and cached upstream).
+    folders = _search_folders_for_live_fetch(mail, e.get("folder") or "")
     needles = _mid_search_needles(mid)
     if want and needles:
-        for folder in _search_folders_for_live_fetch(mail, e.get("folder") or ""):
+        for folder in folders:
             if not _select_folder_resolved(mail, folder):
                 continue
             uids: list[bytes] = []
@@ -1053,6 +1103,17 @@ def _fetch_content_for_entry(
             for uid_b in list(reversed(uids))[:5]:
                 msg = _fetch_uid_body(mail, uid_b.decode(errors="replace"))
                 if msg is not None and _normalize_mid(msg.get("Message-ID")) == want:
+                    return msg
+    # Last resort — emails WITHOUT a Message-ID (some senders omit it) that
+    # moved folders: hunt by subject, then verify subject+date+sender match.
+    if e.get("subject"):
+        for folder in folders:
+            if not _select_folder_resolved(mail, folder):
+                continue
+            uids = _subject_search_uids(mail, e["subject"])
+            for uid_b in list(reversed(uids))[:5]:
+                msg = _fetch_uid_body(mail, uid_b.decode(errors="replace"))
+                if msg is not None and _entry_matches_message(e, msg):
                     return msg
     return None
 
@@ -1133,6 +1194,13 @@ def _local_tz() -> Any:
         return ZoneInfo(MAIL_TZ)
     except Exception:
         return timezone.utc
+
+
+def _from_display(entry: dict[str, Any]) -> str:
+    """Sender for card markdown — Lark's markdown swallows <addr@host> as a
+    tag, so angle brackets become visible ‹›."""
+    raw = entry.get("from_raw") or ", ".join(entry.get("from") or []) or "?"
+    return raw.replace("<", "‹").replace(">", "›")
 
 
 def _fmt_date(entry: dict[str, Any]) -> str:
@@ -1382,7 +1450,7 @@ def _cards_for_entries(title: str, entries: list[dict[str, Any]],
         meta = []
         if n > 1:
             meta.append(f"**#{i}**")
-        meta.append(f"**From:** {e.get('from_raw') or ', '.join(e.get('from') or []) or '?'}")
+        meta.append(f"**From:** {_from_display(e)}")
         meta.append(f"**Date:** {_fmt_date(e)} ({MAIL_TZ})")
         meta_md = "\n".join(meta)
         emit({"tag": "markdown", "content": meta_md}, len(meta_md))
