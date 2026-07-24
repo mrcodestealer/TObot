@@ -2165,7 +2165,8 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
                 "placeholder": {"tag": "plain_text",
                                 "content": "Fill in the middle content of the reply…"},
                 "required": True,
-                "max_length": 5000,
+                # Lark rejects anything above its default maximum of 1000.
+                "max_length": 1000,
             },
             {
                 "tag": "button",
