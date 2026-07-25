@@ -2468,6 +2468,8 @@ _MACHINE_ENV_ORDER = {"PROD": 0, "QAT": 1, "UAT": 2}
 _MACHINE_MATCH_CAP = 600   # absolute safety cap across all cards
 _MACHINE_PAGE = 150        # machines per card; more matches roll into follow-up cards
 _MACHINE_ENV_KEYWORDS = {"prod": "PROD", "qat": "QAT", "uat": "UAT", "all": "ALL"}
+# Looks like a machine identifier: NCH1200 / WF8123 / bare 1397 …
+_MACHINE_ID_RE = re.compile(r"^[A-Za-z]{1,8}\d{2,6}$|^\d{3,6}$")
 _MACHINE_USAGE = (
     "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
     "(`/machine 2205`); separate several queries with commas or new lines.\n"
@@ -2475,6 +2477,8 @@ _MACHINE_USAGE = (
     "machines (a line is matched as one phrase — machine names first, then game types).\n"
     "A venue filters: `/machine mdr bao zhu zhao fu` (that game at MDR), `/machine mdr` "
     "(whole venue), `/machine mdr games` (game types at MDR).\n"
+    "Paste a list too — on a line like `NCH1200 Red Festival` only the machine ID is "
+    "looked up (a bare number like `1397` also works); the game words are ignored.\n"
     "`/machine games` lists every game type with machine counts.\n"
     "Shows PROD only; start with an environment to switch: "
     "`/machine qat NWR2205`, `/machine uat 2205`, `/machine all NWR2205`."
@@ -2550,19 +2554,22 @@ def _machine_match_rows(queries: list[str],
             continue
         # Word fallback matches machine NAMES only — never game types, so a
         # phrase like `Bao Zhu Zhao Fu` can't leak machines of other games
-        # via `bao`/`fu` substrings.
+        # via `bao`/`fu` substrings. When the line contains machine-ID-looking
+        # words (`NCH1200 Red Festival` or `1397 Purple Celebration`), ONLY the
+        # IDs are looked up — the game-name words are pasted commentary.
         words = [w for w in q.split() if _machine_alnum(w)]
         if len(words) > 1:
+            id_words = [w for w in words if _MACHINE_ID_RE.match(_machine_alnum(w))]
             missed_words: list[str] = []
             any_hit = False
-            for w in words:
+            for w in (id_words or words):
                 wh = _hits_for(_machine_alnum(w), include_games=False)
                 if wh:
                     _add(wh)
                     any_hit = True
                 else:
                     missed_words.append(w)
-            if any_hit:
+            if id_words or any_hit:
                 not_found.extend(missed_words)
             else:
                 not_found.append(q)  # whole phrase missed — report it as one miss
