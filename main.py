@@ -2401,12 +2401,16 @@ def send_reply_email(spec: dict[str, Any], content: str) -> None:
         def _h(s: str) -> str:
             return html_lib.escape(s).replace("\n", "<br>\n")
 
+        # Lark-native look: the collapsible section holds the From/Date/Subject/
+        # To/Cc block in a gray rounded box, with the quoted body plain below it
+        # (no bordered blockquote). The <blockquote> wrapper stays borderless —
+        # it is what mail clients key on for the "Show email thread" collapse.
         msg.add_alternative(
             "<html><body>"
             f"<div>{_h(content)}</div><br>"
-            '<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #cccccc;'
-            'padding-left:1ex">'
-            + (f"<div>{_h(header)}</div><br>" if header else "")
+            '<blockquote style="margin:0;border:none;padding:0">'
+            + (('<div style="background:rgba(127,127,127,0.15);border-radius:8px;'
+                f'padding:12px 16px">{_h(header)}</div><br>') if header else "")
             + f"<div>{_h(quote)}</div>"
             "</blockquote>"
             "</body></html>",
