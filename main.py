@@ -45,6 +45,7 @@ import os
 import re
 import smtplib
 import ssl
+import subprocess
 import sys
 import uuid
 import threading
@@ -2419,6 +2420,8 @@ HELP_TEXT = (
     "  (/machine man fu bao); a venue filters (/machine mdr bao zhu zhao fu, /machine mdr);\n"
     "  /machine games lists every game type with counts (also per venue: /machine mdr games);\n"
     "  other envs: /machine qat NWR2205 · /machine all 2205\n"
+    "/deploy — git pull origin main + restart the bot service\n"
+    "  (natural text works too: \"git pull and restart service\")\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2465,6 +2468,80 @@ def _do_scan_command(chat_id: str, message_id: str) -> None:
                    f"✅ Scan done — {seen} emails indexed in the {WINDOW_DAYS}-day window.")
     except Exception as ex:
         reply_text(chat_id, message_id, f"❌ Scan failed: {ex!r}")
+
+
+# ===================== /deploy — git pull origin main + restart the systemd service =====================
+# Mirrored from machine bot: `/deploy`, `/gitpullrestart`, or natural text like
+# "git pull and restart service" (also 重启 variants). Gated by DEPLOY_ALLOWED_OPEN_IDS.
+TOBOT_SERVICE = (_env("TOBOT_SERVICE", default="tobot") or "tobot").strip() or "tobot"
+_DEPLOY_ALLOWED_OPEN_IDS = {
+    x.strip() for x in (_env("DEPLOY_ALLOWED_OPEN_IDS") or "").split(",") if x.strip()
+}
+
+
+def _deploy_allowed(sender_open_id: str) -> bool:
+    """Empty allowlist = anyone who can address the bot may deploy; otherwise restrict to it."""
+    if not _DEPLOY_ALLOWED_OPEN_IDS:
+        return True
+    return (sender_open_id or "").strip() in _DEPLOY_ALLOWED_OPEN_IDS
+
+
+def _looks_like_deploy_command(text: str) -> bool:
+    """Match ``git pull origin main and restart service`` / ``/deploy`` / ``/gitpullrestart``."""
+    t = (text or "").strip().casefold()
+    if not t:
+        return False
+    if t in ("/deploy", "/gitpullrestart") or t.startswith("/deploy ") or t.startswith(
+        "/gitpullrestart "
+    ):
+        return True
+    has_pull = bool(re.search(r"\bgit\s+pull\b", t)) or bool(
+        re.search(r"\bpull\s+(?:origin|code|repo|latest)\b", t)
+    )
+    has_restart = bool(re.search(r"\b(?:restart|reboot)\b", t)) or "重启" in t
+    if has_pull and has_restart:
+        return True
+    return bool(re.search(r"拉代码.*重启|部署.*重启", t))
+
+
+def _schedule_service_restart(delay_sec: float = 2.0) -> None:
+    """Restart the systemd unit from a DETACHED process so it survives this process exiting."""
+    try:
+        subprocess.Popen(
+            ["bash", "-c", f"sleep {delay_sec}; systemctl restart {TOBOT_SERVICE}"],
+            start_new_session=True,
+        )
+        print(f"[deploy] scheduled: systemctl restart {TOBOT_SERVICE} (in {delay_sec}s)", flush=True)
+    except Exception as exc:
+        print(f"[deploy] restart schedule failed: {exc!r}", flush=True)
+
+
+def _do_deploy(chat_id: str, message_id: str) -> None:
+    reply_text(chat_id, message_id, f"⏳ `git pull origin main` + restart `{TOBOT_SERVICE}`…")
+    try:
+        proc = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            cwd=_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception as exc:
+        reply_text(chat_id, message_id, f"❌ `git pull origin main` failed: {exc!r}")
+        return
+    out = "\n".join(x for x in (proc.stdout, proc.stderr) if x).strip()
+    tail = out[-1200:] if len(out) > 1200 else out
+    if proc.returncode != 0:
+        reply_text(
+            chat_id, message_id,
+            f"❌ `git pull origin main` failed (exit {proc.returncode}).\n{tail or '(no output)'}",
+        )
+        return
+    reply_text(
+        chat_id, message_id,
+        f"✅ `git pull origin main` OK — restarting `{TOBOT_SERVICE}`…\n{tail or 'Already up to date.'}",
+    )
+    _schedule_service_restart()
 
 
 # ===================== /machine — status card from webmachine_data.json =====================
@@ -2876,7 +2953,8 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
         reply_card(chat_id, message_id, card)
 
 
-def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -> None:
+def _process_message(text: str, chat_id: str, message_id: str, directed: bool,
+                     sender_id: str = "") -> None:
     """Pick the action for a message; ack with GotIt while working, Done after.
 
     ``directed`` = P2P chat or the bot was @-mentioned. Undirected group chatter
@@ -2891,7 +2969,15 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -
     action = None
     # The /searchwith* variants must be tested before plain /search — each has
     # "/search" as a prefix and would otherwise be swallowed by it.
-    if low.startswith("/searchwithoutai"):
+    if _looks_like_deploy_command(t) and (
+        directed or low.startswith(("/deploy", "/gitpullrestart"))
+    ):
+        if _deploy_allowed(sender_id):
+            action = lambda: _do_deploy(chat_id, message_id)
+        else:
+            action = lambda: reply_text(chat_id, message_id,
+                                        "❌ You are not allowed to deploy this bot.")
+    elif low.startswith("/searchwithoutai"):
         action = lambda: _do_searchwithoutai(chat_id, message_id, t[len("/searchwithoutai"):])
     elif low.startswith("/searchwithai"):
         action = lambda: _do_searchwithai(chat_id, message_id, t[len("/searchwithai"):])
@@ -3009,8 +3095,11 @@ def _on_message(data) -> None:
         if not text:
             return
         directed = chat_type == "p2p" or _bot_mentioned(msg)
+        sender_id = (getattr(getattr(getattr(data.event, "sender", None), "sender_id", None),
+                             "open_id", "") or "")
         threading.Thread(
-            target=_process_message, args=(text, chat_id, message_id, directed), daemon=True
+            target=_process_message, args=(text, chat_id, message_id, directed, sender_id),
+            daemon=True,
         ).start()
     except Exception as ex:
         print(f"[lark-ws] on_message failed: {ex!r}", flush=True)
