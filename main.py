@@ -2409,7 +2409,8 @@ HELP_TEXT = (
     "/machine <name(s) or game type> — PROD machine status card from the live scrape,\n"
     "  split into 🟢 Open to players (online/occupy, no maintain, no test) vs 🛠️ Maintenance\n"
     "  machine. Digits work (/machine 2205); a game type lists all its machines\n"
-    "  (/machine man fu bao); /machine games lists every game type with counts;\n"
+    "  (/machine man fu bao); a venue filters (/machine mdr bao zhu zhao fu, /machine mdr);\n"
+    "  /machine games lists every game type with counts (also per venue: /machine mdr games);\n"
     "  other envs: /machine qat NWR2205 · /machine all 2205\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
@@ -2472,6 +2473,8 @@ _MACHINE_USAGE = (
     "(`/machine 2205`); separate several queries with commas or new lines.\n"
     "A game type works too: `/machine Standalone` or `/machine man fu bao` lists all its "
     "machines (a line is matched as one phrase — machine names first, then game types).\n"
+    "A venue filters: `/machine mdr bao zhu zhao fu` (that game at MDR), `/machine mdr` "
+    "(whole venue), `/machine mdr games` (game types at MDR).\n"
     "`/machine games` lists every game type with machine counts.\n"
     "Shows PROD only; start with an environment to switch: "
     "`/machine qat NWR2205`, `/machine uat 2205`, `/machine all NWR2205`."
@@ -2653,7 +2656,7 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
             by_env.setdefault(_machine_row_env(r), []).append(_machine_row_md(r))
         parts = [header]
         for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
-            if env_label == "ALL":
+            if env_label.startswith("ALL"):
                 parts.append(f"📍 **{env}**")
             parts.extend(by_env[env])
         return "\n".join(parts)
@@ -2736,13 +2739,22 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
     if first and first[0].lower() in _MACHINE_ENV_KEYWORDS:
         env_sel = _MACHINE_ENV_KEYWORDS[first[0].lower()]
         raw = first[1] if len(first) > 1 else ""
+    rows, path, mtime = _machine_load_rows()
+    # Optional venue filter next (belongs values from the data: mdr, nwr, cp, …):
+    # `/machine mdr bao zhu zhao fu` = that game at MDR only; `/machine mdr` = whole venue.
+    venue_sel = ""
+    venues = {_machine_alnum(str(r.get("belongs") or "")) for r in rows}
+    venues.discard("")
+    first = raw.split(None, 1)
+    if first and _machine_alnum(first[0]) in venues:
+        venue_sel = _machine_alnum(first[0])
+        raw = first[1] if len(first) > 1 else ""
     # One query per line (or comma) — a line is tried as a whole phrase first,
     # so `/machine man fu bao` is ONE game-type lookup, not three words.
     queries = [q.strip() for q in re.split(r"[\n,;，；]+", raw) if q.strip()]
-    if not queries:
+    if not queries and not venue_sel:
         reply_text(chat_id, message_id, _MACHINE_USAGE)
         return
-    rows, path, mtime = _machine_load_rows()
     if not rows:
         if mtime <= 0:
             head = (f"⚠️ No machine snapshot yet — {os.path.basename(path)} doesn't exist, "
@@ -2753,7 +2765,15 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
                     "backend failed to launch a browser or log in).")
         reply_text(chat_id, message_id, head + "\n\nScrape diagnosis:\n" + _machine_scrape_diag())
         return
-    pool = rows if env_sel == "ALL" else [r for r in rows if _machine_row_env(r) == env_sel]
+    def _in_scope(r: dict[str, Any]) -> bool:
+        if env_sel != "ALL" and _machine_row_env(r) != env_sel:
+            return False
+        if venue_sel and _machine_alnum(str(r.get("belongs") or "")) != venue_sel:
+            return False
+        return True
+
+    pool = [r for r in rows if _in_scope(r)]
+    scope_label = f"{env_sel} · {venue_sel}" if venue_sel else env_sel
     # `/machine games` — list every game type with machine counts (to find exact names).
     if len(queries) == 1 and queries[0].lower() in ("games", "game types", "gametypes", "game type"):
         stats: dict[str, list[Any]] = {}
@@ -2775,18 +2795,27 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text",
-                          "content": f"🎰 Game types ({env_sel}) — {len(ordered)} games, "
+                          "content": f"🎰 Game types ({scope_label}) — {len(ordered)} games, "
                                      f"{sum(s[1] for s in ordered)} machines"[:150]},
                 "template": "blue",
             },
             "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
         })
         return
-    matched, not_found = _machine_match_rows(queries, pool)
-    # Misses that DO exist in another environment get a hint instead of "not found".
+    if queries:
+        matched, not_found = _machine_match_rows(queries, pool)
+    else:
+        # Venue alone (`/machine mdr`) — every machine of that venue.
+        matched = sorted(pool, key=lambda r: (
+            _MACHINE_ENV_ORDER.get(str(r.get("environment") or "").upper(), 9),
+            str(r.get("belongs") or "").lower(),
+            str(r.get("name") or "").lower(),
+        ))
+        not_found = []
+    # Misses that DO exist outside the selected scope get a hint instead of "not found".
     elsewhere: list[tuple[str, list[str]]] = []
-    if env_sel != "ALL" and not_found:
-        other_rows = [r for r in rows if _machine_row_env(r) != env_sel]
+    if not_found and (env_sel != "ALL" or venue_sel):
+        other_rows = [r for r in rows if not _in_scope(r)]
         hard_missing: list[str] = []
         for tok in not_found:
             m2, _ = _machine_match_rows([tok], other_rows)
@@ -2825,7 +2854,7 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
             not_found if last else [],
             mtime,
             truncated=over if last else 0,
-            env_label=env_sel,
+            env_label=scope_label,
             elsewhere=elsewhere if last else [],
             page=(pi, len(pages)) if len(pages) > 1 else None,
             suggests=suggests if last else None,
