@@ -2463,7 +2463,8 @@ def _do_scan_command(chat_id: str, message_id: str) -> None:
 # smmachine.py) keeps fresh — instant reply, no browser is launched here.
 
 _MACHINE_ENV_ORDER = {"PROD": 0, "QAT": 1, "UAT": 2}
-_MACHINE_MATCH_CAP = 60
+_MACHINE_MATCH_CAP = 600   # absolute safety cap across all cards
+_MACHINE_PAGE = 150        # machines per card; more matches roll into follow-up cards
 _MACHINE_ENV_KEYWORDS = {"prod": "PROD", "qat": "QAT", "uat": "UAT", "all": "ALL"}
 _MACHINE_USAGE = (
     "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
@@ -2501,11 +2502,13 @@ def _machine_load_rows() -> tuple[list[dict[str, Any]], str, float]:
     return [r for r in rows if isinstance(r, dict)], path, mtime
 
 
-def _machine_match_rows(tokens: list[str],
+def _machine_match_rows(queries: list[str],
                         rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Per token: machine-name match first (exact alnum, else substring — so `2205`
+    """Per query: machine-name match first (exact alnum, else substring — so `2205`
     finds NWR2205); when no name matches, fall back to game type the same way
-    (so `Standalone` lists every Standalone machine)."""
+    (so `Standalone` lists every Standalone machine). A multi-word query is tried
+    as ONE phrase first (`man fu bao` → game ManFuBao); only when the phrase
+    matches nothing is it split into per-word lookups."""
     named, gamed = [], []
     for r in rows:
         na = _machine_alnum(str(r.get("name") or ""))
@@ -2514,24 +2517,42 @@ def _machine_match_rows(tokens: list[str],
             named.append((na, r))
         if ga:
             gamed.append((ga, r))
+
+    def _hits_for(ta: str) -> list[dict[str, Any]]:
+        h = [r for na, r in named if na == ta] or [r for na, r in named if ta in na]
+        if not h:
+            h = [r for ga, r in gamed if ga == ta] or [r for ga, r in gamed if ta in ga]
+        return h
+
     matched: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     not_found: list[str] = []
-    for tok in tokens:
-        ta = _machine_alnum(tok)
-        if not ta:
-            continue
-        hits = [r for na, r in named if na == ta] or [r for na, r in named if ta in na]
-        if not hits:
-            hits = [r for ga, r in gamed if ga == ta] or [r for ga, r in gamed if ta in ga]
-        if not hits:
-            not_found.append(tok)
-            continue
+
+    def _add(hits: list[dict[str, Any]]) -> None:
         for r in hits:
             key = (str(r.get("environment")), str(r.get("belongs")), str(r.get("name")))
             if key not in seen:
                 seen.add(key)
                 matched.append(r)
+
+    for q in queries:
+        qa = _machine_alnum(q)
+        if not qa:
+            continue
+        hits = _hits_for(qa)
+        if hits:
+            _add(hits)
+            continue
+        words = [w for w in q.split() if _machine_alnum(w)]
+        if len(words) > 1:
+            for w in words:
+                wh = _hits_for(_machine_alnum(w))
+                if wh:
+                    _add(wh)
+                else:
+                    not_found.append(w)
+        else:
+            not_found.append(q)
     matched.sort(key=lambda r: (
         _MACHINE_ENV_ORDER.get(str(r.get("environment") or "").upper(), 9),
         str(r.get("belongs") or "").lower(),
@@ -2594,7 +2615,8 @@ def _machine_age_label(mtime: float) -> str:
 
 def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
                   mtime: float, truncated: int, env_label: str,
-                  elsewhere: list[tuple[str, list[str]]]) -> dict[str, Any]:
+                  elsewhere: list[tuple[str, list[str]]],
+                  page: Optional[tuple[int, int]] = None) -> dict[str, Any]:
     open_rows = [r for r in matched if _machine_is_open(r)]
     maint_rows = [r for r in matched if not _machine_is_open(r)]
     misses = len(not_found) + len(elsewhere)
@@ -2607,6 +2629,8 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
     title = f"🎰 Machine status ({env_label}) — {len(open_rows)} open, {len(maint_rows)} maintenance"
     if misses:
         title += f", {misses} not found"
+    if page:
+        title += f" · page {page[0]}/{page[1]}"
     elements: list[dict[str, Any]] = []
 
     def _section_md(header: str, rows_: list[dict[str, Any]]) -> str:
@@ -2688,11 +2712,16 @@ def _machine_scrape_diag() -> str:
 
 
 def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
-    tokens = [w for w in re.split(r"[\s,;，；]+", (arg or "").strip()) if w]
+    raw = (arg or "").strip()
     env_sel = "PROD"
-    if tokens and tokens[0].lower() in _MACHINE_ENV_KEYWORDS:
-        env_sel = _MACHINE_ENV_KEYWORDS[tokens.pop(0).lower()]
-    if not tokens:
+    first = raw.split(None, 1)
+    if first and first[0].lower() in _MACHINE_ENV_KEYWORDS:
+        env_sel = _MACHINE_ENV_KEYWORDS[first[0].lower()]
+        raw = first[1] if len(first) > 1 else ""
+    # One query per line (or comma) — a line is tried as a whole phrase first,
+    # so `/machine man fu bao` is ONE game-type lookup, not three words.
+    queries = [q.strip() for q in re.split(r"[\n,;，；]+", raw) if q.strip()]
+    if not queries:
         reply_text(chat_id, message_id, _MACHINE_USAGE)
         return
     rows, path, mtime = _machine_load_rows()
@@ -2707,7 +2736,7 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
         reply_text(chat_id, message_id, head + "\n\nScrape diagnosis:\n" + _machine_scrape_diag())
         return
     pool = rows if env_sel == "ALL" else [r for r in rows if _machine_row_env(r) == env_sel]
-    matched, not_found = _machine_match_rows(tokens, pool)
+    matched, not_found = _machine_match_rows(queries, pool)
     # Misses that DO exist in another environment get a hint instead of "not found".
     elsewhere: list[tuple[str, list[str]]] = []
     if env_sel != "ALL" and not_found:
@@ -2723,9 +2752,20 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
                 hard_missing.append(tok)
         not_found = hard_missing
     shown = matched[:_MACHINE_MATCH_CAP]
-    card = _machine_card(shown, not_found, mtime, truncated=len(matched) - len(shown),
-                         env_label=env_sel, elsewhere=elsewhere)
-    reply_card(chat_id, message_id, card)
+    over = len(matched) - len(shown)
+    pages = [shown[i:i + _MACHINE_PAGE] for i in range(0, len(shown), _MACHINE_PAGE)] or [[]]
+    for pi, page_rows in enumerate(pages, 1):
+        last = pi == len(pages)
+        card = _machine_card(
+            page_rows,
+            not_found if last else [],
+            mtime,
+            truncated=over if last else 0,
+            env_label=env_sel,
+            elsewhere=elsewhere if last else [],
+            page=(pi, len(pages)) if len(pages) > 1 else None,
+        )
+        reply_card(chat_id, message_id, card)
 
 
 def _process_message(text: str, chat_id: str, message_id: str, directed: bool) -> None:
