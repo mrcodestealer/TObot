@@ -2055,6 +2055,30 @@ _REPLY_CLOSING = "Thank you and best regards,"
 _REPLY_BATCH_TTL_SEC = 24 * 3600
 _REPLY_BATCH_MAX = 20
 
+# Recipients known to bounce with "invalid recipient address" — removed from every
+# reply-all (with a ⚠️ notice on the preview card). Extend/override with
+# TOBOT_REPLY_BLOCKED_RECIPIENTS (comma-separated addresses, or `@domain` to block a domain).
+_REPLY_BLOCKED_DEFAULT = (
+    "chabelita.honrada@hotelstotsenberg.com,"
+    "operationsupport.team@hotelstotsenberg.com,"
+    "cxrteam@igo.email"
+)
+_REPLY_BLOCKED_RECIPIENTS = {
+    x.strip().casefold()
+    for x in _env("TOBOT_REPLY_BLOCKED_RECIPIENTS", default=_REPLY_BLOCKED_DEFAULT).split(",")
+    if x.strip()
+}
+
+
+def _reply_recipient_blocked(addr: str) -> bool:
+    al = (addr or "").strip().casefold()
+    if not al:
+        return False
+    if al in _REPLY_BLOCKED_RECIPIENTS:
+        return True
+    dom = al.rsplit("@", 1)[-1] if "@" in al else ""
+    return bool(dom) and f"@{dom}" in _REPLY_BLOCKED_RECIPIENTS
+
 _pending_replies: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _pending_replies_lock = threading.Lock()
 
@@ -2092,12 +2116,16 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
         references = re.sub(r"\s+", " ", msg.get("References") or "").strip()
     own = _own_addresses()
     to_out: list[str] = []
+    removed: list[str] = []
     seen: set[str] = set()
     for a in frm + to:
         al = a.strip().casefold()
         if al and al not in own and al not in seen:
             seen.add(al)
-            to_out.append(a.strip())
+            if _reply_recipient_blocked(a):
+                removed.append(a.strip())
+            else:
+                to_out.append(a.strip())
     # Cc: the latest message's Cc first, then every other participant seen in
     # the whole thread (oldest→newest), so the full distribution stays intact.
     thread_addrs: list[str] = list(cc)
@@ -2118,13 +2146,17 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
         al = a.strip().casefold()
         if al and al not in own and al not in seen:
             seen.add(al)
-            cc_out.append(a.strip())
+            if _reply_recipient_blocked(a):
+                removed.append(a.strip())
+            else:
+                cc_out.append(a.strip())
     mid = (latest.get("message_id") or "").strip()
     return {
         "title": entries[0].get("subject") or latest.get("subject") or "",
         "subject": _reply_subject(latest.get("subject") or ""),
         "to": to_out,
         "cc": cc_out,
+        "removed": removed,
         "in_reply_to": mid,
         "references": (f"{references} {mid}".strip() if mid else references),
         "latest_from": latest.get("from_raw") or ", ".join(frm) or "?",
@@ -2174,12 +2206,16 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
         "(reply-all to that thread's latest message):")]
     for i, s in enumerate(specs, 1):
         elements.append({"tag": "hr"})
-        elements.append(_md("\n".join([
+        lines = [
             f"**#{i} {s['title']}**",
             f"**To:** {_esc_addrs(s['to'])}",
             f"**Cc:** {_esc_addrs(s['cc'])}",
-            f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*",
-        ])))
+        ]
+        if s.get("removed"):
+            lines.append("⚠️ **Detected invalid recipient address — removed:** "
+                         f"{_esc_addrs(s['removed'])}")
+        lines.append(f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*")
+        elements.append(_md("\n".join(lines)))
     elements.append({"tag": "hr"})
     elements.append(_md("**Edit the reply below — it is sent exactly as shown:**"))
     elements.append({
