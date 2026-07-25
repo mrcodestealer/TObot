@@ -2406,9 +2406,10 @@ HELP_TEXT = (
     "  (content + images), no AI\n"
     "/reply + one email title per line — shows every email's reply-all To/Cc in\n"
     "  a card; fill in ONE content and press Send to reply-all to each of them\n"
-    "/machine <name(s)> — PROD machine status card from the live scrape, split into\n"
-    "  🟢 Open to players (online/occupy, no maintain, no test) vs 🛠️ Maintenance machine\n"
-    "  (digits work: /machine 2205; other envs: /machine qat NWR2205 · /machine all 2205)\n"
+    "/machine <name(s) or game type> — PROD machine status card from the live scrape,\n"
+    "  split into 🟢 Open to players (online/occupy, no maintain, no test) vs 🛠️ Maintenance\n"
+    "  machine. Digits work (/machine 2205); a game type lists all its machines\n"
+    "  (/machine Standalone); other envs: /machine qat NWR2205 · /machine all 2205\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2467,6 +2468,8 @@ _MACHINE_ENV_KEYWORDS = {"prod": "PROD", "qat": "QAT", "uat": "UAT", "all": "ALL
 _MACHINE_USAGE = (
     "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
     "(`/machine 2205`), several names separated by spaces or new lines.\n"
+    "A game type works too: `/machine Standalone` lists every Standalone machine "
+    "(names are matched first, then game types).\n"
     "Shows PROD only; start with an environment to switch: "
     "`/machine qat NWR2205`, `/machine uat 2205`, `/machine all NWR2205`."
 )
@@ -2500,12 +2503,17 @@ def _machine_load_rows() -> tuple[list[dict[str, Any]], str, float]:
 
 def _machine_match_rows(tokens: list[str],
                         rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
-    """Exact alnum name match per token, else substring (so `2205` finds NWR2205)."""
-    named = []
+    """Per token: machine-name match first (exact alnum, else substring — so `2205`
+    finds NWR2205); when no name matches, fall back to game type the same way
+    (so `Standalone` lists every Standalone machine)."""
+    named, gamed = [], []
     for r in rows:
         na = _machine_alnum(str(r.get("name") or ""))
+        ga = _machine_alnum(str(r.get("game_type") or ""))
         if na:
             named.append((na, r))
+        if ga:
+            gamed.append((ga, r))
     matched: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     not_found: list[str] = []
@@ -2514,6 +2522,8 @@ def _machine_match_rows(tokens: list[str],
         if not ta:
             continue
         hits = [r for na, r in named if na == ta] or [r for na, r in named if ta in na]
+        if not hits:
+            hits = [r for ga, r in gamed if ga == ta] or [r for ga, r in gamed if ta in ga]
         if not hits:
             not_found.append(tok)
             continue
