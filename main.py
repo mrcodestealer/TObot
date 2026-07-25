@@ -2406,9 +2406,9 @@ HELP_TEXT = (
     "  (content + images), no AI\n"
     "/reply + one email title per line — shows every email's reply-all To/Cc in\n"
     "  a card; fill in ONE content and press Send to reply-all to each of them\n"
-    "/machine <name(s)> — PROD machine status card from the live scrape\n"
-    "  (🟢 online / 🔴 offline · 🛠️ maintain / ✅ normal · 🧪 test; digits work: /machine 2205)\n"
-    "  other environments: /machine qat NWR2205 · /machine uat 2205 · /machine all NWR2205\n"
+    "/machine <name(s)> — PROD machine status card from the live scrape, split into\n"
+    "  🟢 Open to players (online/occupy, no maintain, no test) vs 🛠️ Maintenance machine\n"
+    "  (digits work: /machine 2205; other envs: /machine qat NWR2205 · /machine all 2205)\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2550,9 +2550,45 @@ def _machine_status_emoji(status: str) -> str:
     return "❔"
 
 
+def _machine_row_env(r: dict[str, Any]) -> str:
+    return str(r.get("environment") or "PROD").strip().upper() or "PROD"
+
+
+def _machine_is_open(r: dict[str, Any]) -> bool:
+    """Open to players = online AND status normal/occupy AND not maintain AND not test.
+
+    Everything else (offline, maintain, test, unknown status) counts as a
+    maintenance machine.
+    """
+    online = str(r.get("online") or "").lower()
+    if "offline" in online or "online" not in online:
+        return False
+    if r.get("is_test"):
+        return False
+    status = str(r.get("status") or "").lower()
+    if "maintain" in status:
+        return False
+    return "normal" in status or "occupy" in status
+
+
+def _machine_lead_emoji(r: dict[str, Any]) -> str:
+    """🟢 open to players; otherwise the reason it counts as maintenance."""
+    if _machine_is_open(r):
+        return "🟢"
+    online = str(r.get("online") or "").lower()
+    if "offline" in online or "online" not in online:
+        return "🔴"
+    if "maintain" in str(r.get("status") or "").lower():
+        return "🛠️"
+    if r.get("is_test"):
+        return "🧪"
+    return "⚪"
+
+
 def _machine_row_md(r: dict[str, Any]) -> str:
     """Two lines per machine: bold name with its light, then labeled details."""
-    on_emoji, on_label = _machine_online_emoji(str(r.get("online") or ""))
+    _, on_label = _machine_online_emoji(str(r.get("online") or ""))
+    on_emoji = _machine_lead_emoji(r)
     on_icon = {"Online": "📶", "Offline": "📴"}.get(on_label, "❓")
     status = str(r.get("status") or "").strip() or "—"
     belongs = str(r.get("belongs") or "—").strip() or "—"
@@ -2583,25 +2619,35 @@ def _machine_age_label(mtime: float) -> str:
 def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
                   mtime: float, truncated: int, env_label: str,
                   elsewhere: list[tuple[str, list[str]]]) -> dict[str, Any]:
-    onls = [str(r.get("online") or "").lower() for r in matched]
+    open_rows = [r for r in matched if _machine_is_open(r)]
+    maint_rows = [r for r in matched if not _machine_is_open(r)]
     misses = len(not_found) + len(elsewhere)
-    if matched and not misses and all("online" in s and "offline" not in s for s in onls):
+    if matched and not misses and not maint_rows:
         template = "green"
-    elif not matched or any("offline" in s for s in onls):
+    elif not matched or not open_rows:
         template = "red"
     else:
         template = "orange"
-    title = f"🎰 Machine status ({env_label}) — {len(matched)} found"
+    title = f"🎰 Machine status ({env_label}) — {len(open_rows)} open, {len(maint_rows)} maintenance"
     if misses:
         title += f", {misses} not found"
     elements: list[dict[str, Any]] = []
-    by_env: dict[str, list[str]] = {}
-    for r in matched:
-        env = str(r.get("environment") or "PROD").strip().upper() or "PROD"
-        by_env.setdefault(env, []).append(_machine_row_md(r))
-    for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
-        elements.append({"tag": "markdown",
-                         "content": f"📍 **{env}**\n" + "\n\n".join(by_env[env])})
+
+    def _section(header: str, rows_: list[dict[str, Any]]) -> None:
+        if not rows_:
+            return
+        by_env: dict[str, list[str]] = {}
+        for r in rows_:
+            by_env.setdefault(_machine_row_env(r), []).append(_machine_row_md(r))
+        parts = [header]
+        for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
+            if env_label == "ALL":
+                parts.append(f"📍 **{env}**")
+            parts.append("\n\n".join(by_env[env]))
+        elements.append({"tag": "markdown", "content": "\n".join(parts)})
+
+    _section(f"🟢 **Open to players ({len(open_rows)})**", open_rows)
+    _section(f"🛠️ **Maintenance machine ({len(maint_rows)})**", maint_rows)
     if truncated > 0:
         elements.append({"tag": "markdown",
                          "content": f"*… and {truncated} more matches not shown*"})
@@ -2671,20 +2717,17 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
                     "backend failed to launch a browser or log in).")
         reply_text(chat_id, message_id, head + "\n\nScrape diagnosis:\n" + _machine_scrape_diag())
         return
-    def _row_env(r: dict[str, Any]) -> str:
-        return str(r.get("environment") or "PROD").strip().upper() or "PROD"
-
-    pool = rows if env_sel == "ALL" else [r for r in rows if _row_env(r) == env_sel]
+    pool = rows if env_sel == "ALL" else [r for r in rows if _machine_row_env(r) == env_sel]
     matched, not_found = _machine_match_rows(tokens, pool)
     # Misses that DO exist in another environment get a hint instead of "not found".
     elsewhere: list[tuple[str, list[str]]] = []
     if env_sel != "ALL" and not_found:
-        other_rows = [r for r in rows if _row_env(r) != env_sel]
+        other_rows = [r for r in rows if _machine_row_env(r) != env_sel]
         hard_missing: list[str] = []
         for tok in not_found:
             m2, _ = _machine_match_rows([tok], other_rows)
             if m2:
-                envs = sorted({_row_env(r) for r in m2},
+                envs = sorted({_machine_row_env(r) for r in m2},
                               key=lambda e: _MACHINE_ENV_ORDER.get(e, 9))
                 elsewhere.append((tok, envs))
             else:
