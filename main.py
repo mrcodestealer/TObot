@@ -2530,26 +2530,6 @@ def _machine_match_rows(tokens: list[str],
     return matched, not_found
 
 
-def _machine_online_emoji(online: str) -> tuple[str, str]:
-    s = " ".join((online or "").lower().split())
-    if "offline" in s:
-        return "🔴", "Offline"
-    if "online" in s:
-        return "🟢", "Online"
-    return "⚪", (online or "").strip() or "unknown"
-
-
-def _machine_status_emoji(status: str) -> str:
-    s = (status or "").lower()
-    if "maintain" in s:
-        return "🛠️"
-    if "normal" in s:
-        return "✅"
-    if "occupy" in s:
-        return "🎮"
-    return "❔"
-
-
 def _machine_row_env(r: dict[str, Any]) -> str:
     return str(r.get("environment") or "PROD").strip().upper() or "PROD"
 
@@ -2586,23 +2566,9 @@ def _machine_lead_emoji(r: dict[str, Any]) -> str:
 
 
 def _machine_row_md(r: dict[str, Any]) -> str:
-    """Two lines per machine: bold name with its light, then labeled details."""
-    _, on_label = _machine_online_emoji(str(r.get("online") or ""))
-    on_emoji = _machine_lead_emoji(r)
-    on_icon = {"Online": "📶", "Offline": "📴"}.get(on_label, "❓")
-    status = str(r.get("status") or "").strip() or "—"
-    belongs = str(r.get("belongs") or "—").strip() or "—"
-    game = str(r.get("game_type") or "—").strip() or "—"
-    detail = [
-        f"{_machine_status_emoji(status)} {status}",
-        f"{on_icon} {on_label}",
-        f"🏢 {belongs}",
-        f"🕹️ {game}",
-    ]
-    if r.get("is_test"):
-        detail.append("🧪 TEST")
+    """One line per machine: the lead emoji (🟢 open / 🔴🛠️🧪 why not) + bold name."""
     name = str(r.get("name") or "—").strip()
-    return f"{on_emoji} **{name}**\n{' · '.join(detail)}"
+    return f"{_machine_lead_emoji(r)} **{name}**"
 
 
 def _machine_age_label(mtime: float) -> str:
@@ -2633,9 +2599,7 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
         title += f", {misses} not found"
     elements: list[dict[str, Any]] = []
 
-    def _section(header: str, rows_: list[dict[str, Any]]) -> None:
-        if not rows_:
-            return
+    def _section_md(header: str, rows_: list[dict[str, Any]]) -> str:
         by_env: dict[str, list[str]] = {}
         for r in rows_:
             by_env.setdefault(_machine_row_env(r), []).append(_machine_row_md(r))
@@ -2643,11 +2607,26 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
         for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
             if env_label == "ALL":
                 parts.append(f"📍 **{env}**")
-            parts.append("\n\n".join(by_env[env]))
-        elements.append({"tag": "markdown", "content": "\n".join(parts)})
+            parts.extend(by_env[env])
+        return "\n".join(parts)
 
-    _section(f"🟢 **Open to players ({len(open_rows)})**", open_rows)
-    _section(f"🛠️ **Maintenance machine ({len(maint_rows)})**", maint_rows)
+    open_md = _section_md(f"🟢 **Open to players ({len(open_rows)})**", open_rows) if open_rows else ""
+    maint_md = _section_md(f"🛠️ **Maintenance machine ({len(maint_rows)})**", maint_rows) if maint_rows else ""
+    if open_md and maint_md:
+        # Both groups: open on the left, maintenance on the right.
+        elements.append({
+            "tag": "column_set",
+            "flex_mode": "bisect",
+            "background_style": "default",
+            "columns": [
+                {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "top",
+                 "elements": [{"tag": "markdown", "content": open_md}]},
+                {"tag": "column", "width": "weighted", "weight": 1, "vertical_align": "top",
+                 "elements": [{"tag": "markdown", "content": maint_md}]},
+            ],
+        })
+    elif open_md or maint_md:
+        elements.append({"tag": "markdown", "content": open_md or maint_md})
     if truncated > 0:
         elements.append({"tag": "markdown",
                          "content": f"*… and {truncated} more matches not shown*"})
