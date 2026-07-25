@@ -2660,7 +2660,7 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
                          "content": (f"💡 **{tok}** is not in {env_label} but exists in "
                                      f"{', '.join(envs)} — try `/machine {envs[0].lower()} {tok}`")})
     elements.append({"tag": "markdown",
-                     "content": f"🕒 *updated {_machine_age_label(mtime)} · webmachine_data.json*"})
+                     "content": f"🕒 *Updated {_machine_age_label(mtime)}*"})
     return {
         "config": {"wide_screen_mode": True},
         "header": {
