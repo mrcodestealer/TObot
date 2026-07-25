@@ -124,6 +124,8 @@ CSUPDATE_REASONING = _env("CSUPDATE_REASONING", default="none")
 CSUPDATE_STALE_DAYS = max(1, int(_env("CSUPDATE_STALE_DAYS", default="2")))
 CSUPDATE_MAX_THREADS = max(1, int(_env("CSUPDATE_MAX_THREADS", default="5")))
 CSUPDATE_MAX_IMAGES = max(0, int(_env("CSUPDATE_MAX_IMAGES", default="4")))
+# /searchwithoutai has no LLM cost — allow many more titles than the AI commands.
+NOAI_MAX_TITLES = max(1, int(_env("TOBOT_NOAI_MAX_TITLES", default="20")))
 CSUPDATE_CHARS_PER_MAIL = max(500, int(_env("CSUPDATE_CHARS_PER_MAIL", default="4000")))
 CSUPDATE_TOTAL_CHARS = max(2000, int(_env("CSUPDATE_TOTAL_CHARS", default="24000")))
 
@@ -2010,7 +2012,12 @@ def _do_searchwithoutai(chat_id: str, message_id: str, arg: str) -> None:
                    "Shows the LATEST message of each thread (sender + content + images), "
                    "no AI. Use /search for the whole conversation.")
         return
-    titles = titles[:CSUPDATE_MAX_THREADS]
+    if len(titles) > NOAI_MAX_TITLES:
+        reply_text(chat_id, message_id,
+                   f"ℹ️ Showing the first {NOAI_MAX_TITLES} titles — "
+                   f"{len(titles) - NOAI_MAX_TITLES} skipped "
+                   "(raise TOBOT_NOAI_MAX_TITLES in .env for more).")
+        titles = titles[:NOAI_MAX_TITLES]
     for title in titles:
         entries = _resolve_thread(title)
         if not entries:
