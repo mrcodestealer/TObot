@@ -2386,15 +2386,32 @@ def send_reply_email(spec: dict[str, Any], content: str) -> None:
     if spec.get("references"):
         msg["References"] = spec["references"]
     # The card's text box holds the WHOLE body (template pre-filled) — sent as
-    # typed, with the thread's latest message quoted below in Lark Mail's reply
-    # style (From/Date/Subject/To/Cc block + body), so clients collapse it into
-    # the "Show email thread" section.
-    body = content.strip()
+    # typed, with the thread's latest message quoted below (From/Date/Subject/
+    # To/Cc block + body). The HTML alternative wraps the history in a
+    # <blockquote>, which Lark Mail collapses into "Show email thread"
+    # (plain text alone renders inline — clients can't detect the quote there).
+    content = content.strip()
     quote = (spec.get("quote_body") or "").strip()
+    header = (spec.get("quote_header") or "").strip()
+    body = content
     if REPLY_QUOTE_CHARS and quote:
-        header = (spec.get("quote_header") or "").strip()
         body = f"{body}\n\n\n{header}\n\n{quote}" if header else f"{body}\n\n\n{quote}"
     msg.set_content(body + "\n")
+    if REPLY_QUOTE_CHARS and quote:
+        def _h(s: str) -> str:
+            return html_lib.escape(s).replace("\n", "<br>\n")
+
+        msg.add_alternative(
+            "<html><body>"
+            f"<div>{_h(content)}</div><br>"
+            '<blockquote style="margin:0 0 0 0.8ex;border-left:1px solid #cccccc;'
+            'padding-left:1ex">'
+            + (f"<div>{_h(header)}</div><br>" if header else "")
+            + f"<div>{_h(quote)}</div>"
+            "</blockquote>"
+            "</body></html>",
+            subtype="html",
+        )
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, context=ctx, timeout=60) as smtp:
         smtp.login(MAIL_USER, MAIL_PASSWORD)
