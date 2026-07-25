@@ -2054,6 +2054,9 @@ _REPLY_GREETING = "Hi team,"
 _REPLY_CLOSING = "Thank you and best regards,"
 _REPLY_BATCH_TTL_SEC = 24 * 3600
 _REPLY_BATCH_MAX = 20
+# Quote the thread's latest message below the reply (like a mail client's reply-all;
+# recipients' clients collapse it into the usual show/hide section). 0 disables quoting.
+REPLY_QUOTE_CHARS = max(0, int(_env("TOBOT_REPLY_QUOTE_CHARS", default="20000")))
 
 # Recipients known to bounce with "invalid recipient address" — removed from every
 # reply-all (with a ⚠️ notice on the preview card). Extend/override with
@@ -2150,6 +2153,40 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
                 removed.append(a.strip())
             else:
                 cc_out.append(a.strip())
+    # Quoted history below the reply, in Lark Mail's own reply style: a
+    # From/Date/Subject/To/Cc header block + the latest message's body as-is
+    # (its own nested history travels along), which mail clients collapse into
+    # the "Show email thread" section.
+    quote_body = ""
+    if msg is not None:
+        try:
+            quote_body = extract_body_text(msg)
+        except Exception:
+            quote_body = ""
+    if not quote_body:
+        quote_body = str(latest.get("body") or "")
+    quote_body = quote_body.strip()
+    if REPLY_QUOTE_CHARS and len(quote_body) > REPLY_QUOTE_CHARS:
+        quote_body = quote_body[:REPLY_QUOTE_CHARS] + "\n[... quoted history trimmed ...]"
+    q_from = (_decode_hdr(msg.get("From")) if msg is not None else "") or \
+        latest.get("from_raw") or ", ".join(frm)
+    q_to = (_decode_hdr(msg.get("To")) if msg is not None else "") or ", ".join(to)
+    q_cc = (_decode_hdr(msg.get("Cc")) if msg is not None else "") or ", ".join(cc)
+    q_subject = (_decode_hdr(msg.get("Subject")) if msg is not None else "") or \
+        latest.get("subject") or ""
+    q_ts = float(latest.get("date_ts") or 0.0)
+    if q_ts > 0:
+        q_date = datetime.fromtimestamp(q_ts, _local_tz()).strftime("%a, %b %d, %Y, %H:%M")
+    else:
+        q_date = ((msg.get("Date") or "").strip() if msg is not None else "") or "?"
+    quote_header_lines = [
+        f"From: {q_from}".strip(),
+        f"Date: {q_date}",
+        f"Subject: {q_subject}".rstrip(),
+        f"To: {q_to}".rstrip(),
+    ]
+    if q_cc.strip():
+        quote_header_lines.append(f"Cc: {q_cc}")
     mid = (latest.get("message_id") or "").strip()
     return {
         "title": entries[0].get("subject") or latest.get("subject") or "",
@@ -2157,6 +2194,8 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
         "to": to_out,
         "cc": cc_out,
         "removed": removed,
+        "quote_body": quote_body,
+        "quote_header": "\n".join(quote_header_lines),
         "in_reply_to": mid,
         "references": (f"{references} {mid}".strip() if mid else references),
         "latest_from": latest.get("from_raw") or ", ".join(frm) or "?",
@@ -2217,7 +2256,9 @@ def _reply_preview_card(batch_id: str, specs: list[dict[str, Any]]) -> dict[str,
         lines.append(f"*(replying to the latest message — from {s['latest_from'].replace('<', '‹').replace('>', '›')}, {s['latest_date']})*")
         elements.append(_md("\n".join(lines)))
     elements.append({"tag": "hr"})
-    elements.append(_md("**Edit the reply below — it is sent exactly as shown:**"))
+    elements.append(_md("**Edit the reply below — it is sent exactly as shown:**\n"
+                        "*(each thread's latest message is quoted below your reply, "
+                        "like a normal reply-all — recipients can show/hide it)*"))
     elements.append({
         "tag": "form",
         "name": "reply_form",
@@ -2344,8 +2385,16 @@ def send_reply_email(spec: dict[str, Any], content: str) -> None:
         msg["In-Reply-To"] = spec["in_reply_to"]
     if spec.get("references"):
         msg["References"] = spec["references"]
-    # The card's text box holds the WHOLE body (template pre-filled) — send as-is.
-    msg.set_content(content.strip() + "\n")
+    # The card's text box holds the WHOLE body (template pre-filled) — sent as
+    # typed, with the thread's latest message quoted below in Lark Mail's reply
+    # style (From/Date/Subject/To/Cc block + body), so clients collapse it into
+    # the "Show email thread" section.
+    body = content.strip()
+    quote = (spec.get("quote_body") or "").strip()
+    if REPLY_QUOTE_CHARS and quote:
+        header = (spec.get("quote_header") or "").strip()
+        body = f"{body}\n\n\n{header}\n\n{quote}" if header else f"{body}\n\n\n{quote}"
+    msg.set_content(body + "\n")
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, context=ctx, timeout=60) as smtp:
         smtp.login(MAIL_USER, MAIL_PASSWORD)
