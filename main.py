@@ -2406,8 +2406,9 @@ HELP_TEXT = (
     "  (content + images), no AI\n"
     "/reply + one email title per line — shows every email's reply-all To/Cc in\n"
     "  a card; fill in ONE content and press Send to reply-all to each of them\n"
-    "/machine <name(s)> — machine status card from the live scrape\n"
+    "/machine <name(s)> — PROD machine status card from the live scrape\n"
     "  (🟢 online / 🔴 offline · 🛠️ maintain / ✅ normal · 🧪 test; digits work: /machine 2205)\n"
+    "  other environments: /machine qat NWR2205 · /machine uat 2205 · /machine all NWR2205\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2442,6 +2443,7 @@ def _status_text() -> str:
                      "the first one backfills the whole window and can take several minutes.")
     if last.get("error"):
         lines.append(f"Last scan error: {last['error']}")
+    lines.append(f"Machine scrape: {_machine_scrape_diag()}")
     return "\n".join(lines)
 
 
@@ -2461,9 +2463,12 @@ def _do_scan_command(chat_id: str, message_id: str) -> None:
 
 _MACHINE_ENV_ORDER = {"PROD": 0, "QAT": 1, "UAT": 2}
 _MACHINE_MATCH_CAP = 60
+_MACHINE_ENV_KEYWORDS = {"prod": "PROD", "qat": "QAT", "uat": "UAT", "all": "ALL"}
 _MACHINE_USAGE = (
     "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
-    "(`/machine 2205`), several names separated by spaces or new lines."
+    "(`/machine 2205`), several names separated by spaces or new lines.\n"
+    "Shows PROD only; start with an environment to switch: "
+    "`/machine qat NWR2205`, `/machine uat 2205`, `/machine all NWR2205`."
 )
 
 
@@ -2546,17 +2551,22 @@ def _machine_status_emoji(status: str) -> str:
 
 
 def _machine_row_md(r: dict[str, Any]) -> str:
+    """Two lines per machine: bold name with its light, then labeled details."""
     on_emoji, on_label = _machine_online_emoji(str(r.get("online") or ""))
+    on_icon = {"Online": "📶", "Offline": "📴"}.get(on_label, "❓")
     status = str(r.get("status") or "").strip() or "—"
-    bits = [
-        f"{on_emoji} **{str(r.get('name') or '—').strip()}** — {on_label}",
+    belongs = str(r.get("belongs") or "—").strip() or "—"
+    game = str(r.get("game_type") or "—").strip() or "—"
+    detail = [
         f"{_machine_status_emoji(status)} {status}",
-        str(r.get("belongs") or "—").strip() or "—",
-        str(r.get("game_type") or "—").strip() or "—",
+        f"{on_icon} {on_label}",
+        f"🏢 {belongs}",
+        f"🕹️ {game}",
     ]
     if r.get("is_test"):
-        bits.append("🧪 TEST")
-    return " · ".join(bits)
+        detail.append("🧪 TEST")
+    name = str(r.get("name") or "—").strip()
+    return f"{on_emoji} **{name}**\n{' · '.join(detail)}"
 
 
 def _machine_age_label(mtime: float) -> str:
@@ -2571,17 +2581,19 @@ def _machine_age_label(mtime: float) -> str:
 
 
 def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
-                  mtime: float, truncated: int) -> dict[str, Any]:
+                  mtime: float, truncated: int, env_label: str,
+                  elsewhere: list[tuple[str, list[str]]]) -> dict[str, Any]:
     onls = [str(r.get("online") or "").lower() for r in matched]
-    if matched and not not_found and all("online" in s and "offline" not in s for s in onls):
+    misses = len(not_found) + len(elsewhere)
+    if matched and not misses and all("online" in s and "offline" not in s for s in onls):
         template = "green"
     elif not matched or any("offline" in s for s in onls):
         template = "red"
     else:
         template = "orange"
-    title = f"🎰 Machine status — {len(matched)} found"
-    if not_found:
-        title += f", {len(not_found)} not found"
+    title = f"🎰 Machine status ({env_label}) — {len(matched)} found"
+    if misses:
+        title += f", {misses} not found"
     elements: list[dict[str, Any]] = []
     by_env: dict[str, list[str]] = {}
     for r in matched:
@@ -2589,15 +2601,20 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
         by_env.setdefault(env, []).append(_machine_row_md(r))
     for env in sorted(by_env, key=lambda e: _MACHINE_ENV_ORDER.get(e, 9)):
         elements.append({"tag": "markdown",
-                         "content": f"**{env}**\n" + "\n".join(by_env[env])})
+                         "content": f"📍 **{env}**\n" + "\n\n".join(by_env[env])})
     if truncated > 0:
         elements.append({"tag": "markdown",
                          "content": f"*… and {truncated} more matches not shown*"})
     if not_found:
+        where = f" in {env_label}" if env_label != "ALL" else ""
         elements.append({"tag": "markdown",
-                         "content": "❓ **Not found:** " + ", ".join(not_found[:40])})
+                         "content": f"❓ **Not found{where}:** " + ", ".join(not_found[:40])})
+    for tok, envs in elsewhere[:10]:
+        elements.append({"tag": "markdown",
+                         "content": (f"💡 **{tok}** is not in {env_label} but exists in "
+                                     f"{', '.join(envs)} — try `/machine {envs[0].lower()} {tok}`")})
     elements.append({"tag": "markdown",
-                     "content": f"*webmachine_data.json · updated {_machine_age_label(mtime)}*"})
+                     "content": f"🕒 *updated {_machine_age_label(mtime)} · webmachine_data.json*"})
     return {
         "config": {"wide_screen_mode": True},
         "header": {
@@ -2608,25 +2625,74 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
     }
 
 
+def _machine_scrape_diag() -> str:
+    """Live diagnosis of the background scrape (same process, so state is exact)."""
+    try:
+        import webmachine as _wm
+    except Exception as ex:
+        return f"scrape module unavailable: {ex!r}"
+    if not _wm._scrape_enabled():
+        return "scrape is DISABLED (WEBMACHINE_SCRAPE=0 in .env)"
+    alive = any(th.name == "webmachine-scrape" for th in threading.enumerate())
+    with _wm._scrape_lock:
+        ts = _wm._scrape_ts
+        errs = dict(_wm._scrape_errs)
+        nrows = len(_wm._scrape_rows)
+    if not ts:
+        if alive:
+            return "loop running, first scrape pass hasn't finished yet"
+        return ("loop thread NOT running — the bot started without it; "
+                "check startup logs for '[webmachine]' lines and restart")
+    head = f"last pass {_machine_age_label(ts)}: {nrows} machines, {len(errs)} backend errors"
+    if errs:
+        shown = [f"• {k}: {str(v)[:160]}" for k, v in list(errs.items())[:5]]
+        if len(errs) > 5:
+            shown.append(f"• … +{len(errs) - 5} more backends with errors")
+        head += "\n" + "\n".join(shown)
+    return head
+
+
 def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
     tokens = [w for w in re.split(r"[\s,;，；]+", (arg or "").strip()) if w]
+    env_sel = "PROD"
+    if tokens and tokens[0].lower() in _MACHINE_ENV_KEYWORDS:
+        env_sel = _MACHINE_ENV_KEYWORDS[tokens.pop(0).lower()]
     if not tokens:
         reply_text(chat_id, message_id, _MACHINE_USAGE)
         return
     rows, path, mtime = _machine_load_rows()
     if not rows:
-        reply_text(
-            chat_id, message_id,
-            "⚠️ No machine data yet — the background scrape hasn't written "
-            f"`{os.path.basename(path)}`. It refreshes every "
-            f"{(os.environ.get('WEBMACHINE_SCRAPE_INTERVAL_SEC') or '900').strip() or '900'}s "
-            "after startup; try again in a few minutes (check WEBMACHINE_SCRAPE and the "
-            "backend logins in .env if it never appears).",
-        )
+        if mtime <= 0:
+            head = (f"⚠️ No machine snapshot yet — {os.path.basename(path)} doesn't exist, "
+                    "so no scrape pass has completed since startup.")
+        else:
+            head = (f"⚠️ The last scrape pass found 0 machines — {os.path.basename(path)} "
+                    f"was updated {_machine_age_label(mtime)} but is empty (usually every "
+                    "backend failed to launch a browser or log in).")
+        reply_text(chat_id, message_id, head + "\n\nScrape diagnosis:\n" + _machine_scrape_diag())
         return
-    matched, not_found = _machine_match_rows(tokens, rows)
+    def _row_env(r: dict[str, Any]) -> str:
+        return str(r.get("environment") or "PROD").strip().upper() or "PROD"
+
+    pool = rows if env_sel == "ALL" else [r for r in rows if _row_env(r) == env_sel]
+    matched, not_found = _machine_match_rows(tokens, pool)
+    # Misses that DO exist in another environment get a hint instead of "not found".
+    elsewhere: list[tuple[str, list[str]]] = []
+    if env_sel != "ALL" and not_found:
+        other_rows = [r for r in rows if _row_env(r) != env_sel]
+        hard_missing: list[str] = []
+        for tok in not_found:
+            m2, _ = _machine_match_rows([tok], other_rows)
+            if m2:
+                envs = sorted({_row_env(r) for r in m2},
+                              key=lambda e: _MACHINE_ENV_ORDER.get(e, 9))
+                elsewhere.append((tok, envs))
+            else:
+                hard_missing.append(tok)
+        not_found = hard_missing
     shown = matched[:_MACHINE_MATCH_CAP]
-    card = _machine_card(shown, not_found, mtime, truncated=len(matched) - len(shown))
+    card = _machine_card(shown, not_found, mtime, truncated=len(matched) - len(shown),
+                         env_label=env_sel, elsewhere=elsewhere)
     reply_card(chat_id, message_id, card)
 
 

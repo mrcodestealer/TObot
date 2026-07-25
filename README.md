@@ -17,7 +17,7 @@ Lark chat.
 | `/searchwithai` + one email title per line | AI review of the **latest message only** (qwen): faster — summary, status, and freshness of just the newest email in each thread |
 | `/searchwithoutai` + one email title per line | Just the **latest message** (sender + content + images), **no AI** — the quick "what's the newest reply" view |
 | `/reply` + one email title per line | All-or-nothing reply-all: every title must be found, then ONE card shows each thread's own To/Cc (reply-all to its latest message) with an input box — fill in one content, press **Send**, and each thread gets the reply with its own recipients. Sent from `om@` via SMTP with proper threading (In-Reply-To/References) |
-| `/machine <name(s)>` | Machine status **card with emoji** — 🟢 online / 🔴 offline, 🛠️ maintain / ✅ normal / 🎮 occupy, venue, game type, environment and 🧪 TEST flag, grouped by PROD/QAT/UAT. Digits work (`/machine 2205` finds NWR2205), several names per message OK. Answers instantly from `webmachine_data.json`, kept fresh by the background scrape |
+| `/machine <name(s)>` | **PROD** machine status card with emoji — 🟢 online / 🔴 offline (📶/📴), 🛠️ maintain / ✅ normal / 🎮 occupy, 🏢 venue, 🕹️ game type and 🧪 TEST flag. Digits work (`/machine 2205` finds NWR2205), several names per message OK; misses that exist in another env get a 💡 hint. Prefix with `qat` / `uat` / `all` for other environments (`/machine qat NWR2205`). Answers instantly from `webmachine_data.json`, kept fresh by the background scrape |
 | `/scan` | Force an immediate mailbox re-scan |
 | `/status` | Index size, retention window, last scan (per folder) |
 | `/help` | Help |
