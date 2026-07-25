@@ -2409,7 +2409,8 @@ HELP_TEXT = (
     "/machine <name(s) or game type> — PROD machine status card from the live scrape,\n"
     "  split into 🟢 Open to players (online/occupy, no maintain, no test) vs 🛠️ Maintenance\n"
     "  machine. Digits work (/machine 2205); a game type lists all its machines\n"
-    "  (/machine Standalone); other envs: /machine qat NWR2205 · /machine all 2205\n"
+    "  (/machine man fu bao); /machine games lists every game type with counts;\n"
+    "  other envs: /machine qat NWR2205 · /machine all 2205\n"
     "/scan — force a mailbox re-scan now\n"
     "/status — index size, retention window, last scan\n"
     "/help — this help\n"
@@ -2468,9 +2469,10 @@ _MACHINE_PAGE = 150        # machines per card; more matches roll into follow-up
 _MACHINE_ENV_KEYWORDS = {"prod": "PROD", "qat": "QAT", "uat": "UAT", "all": "ALL"}
 _MACHINE_USAGE = (
     "Usage: /machine <name(s)> — e.g. `/machine NWR2205`, digits work too "
-    "(`/machine 2205`), several names separated by spaces or new lines.\n"
-    "A game type works too: `/machine Standalone` lists every Standalone machine "
-    "(names are matched first, then game types).\n"
+    "(`/machine 2205`); separate several queries with commas or new lines.\n"
+    "A game type works too: `/machine Standalone` or `/machine man fu bao` lists all its "
+    "machines (a line is matched as one phrase — machine names first, then game types).\n"
+    "`/machine games` lists every game type with machine counts.\n"
     "Shows PROD only; start with an environment to switch: "
     "`/machine qat NWR2205`, `/machine uat 2205`, `/machine all NWR2205`."
 )
@@ -2518,9 +2520,9 @@ def _machine_match_rows(queries: list[str],
         if ga:
             gamed.append((ga, r))
 
-    def _hits_for(ta: str) -> list[dict[str, Any]]:
+    def _hits_for(ta: str, include_games: bool = True) -> list[dict[str, Any]]:
         h = [r for na, r in named if na == ta] or [r for na, r in named if ta in na]
-        if not h:
+        if not h and include_games:
             h = [r for ga, r in gamed if ga == ta] or [r for ga, r in gamed if ta in ga]
         return h
 
@@ -2543,14 +2545,24 @@ def _machine_match_rows(queries: list[str],
         if hits:
             _add(hits)
             continue
+        # Word fallback matches machine NAMES only — never game types, so a
+        # phrase like `Bao Zhu Zhao Fu` can't leak machines of other games
+        # via `bao`/`fu` substrings.
         words = [w for w in q.split() if _machine_alnum(w)]
         if len(words) > 1:
+            missed_words: list[str] = []
+            any_hit = False
             for w in words:
-                wh = _hits_for(_machine_alnum(w))
+                wh = _hits_for(_machine_alnum(w), include_games=False)
                 if wh:
                     _add(wh)
+                    any_hit = True
                 else:
-                    not_found.append(w)
+                    missed_words.append(w)
+            if any_hit:
+                not_found.extend(missed_words)
+            else:
+                not_found.append(q)  # whole phrase missed — report it as one miss
         else:
             not_found.append(q)
     matched.sort(key=lambda r: (
@@ -2616,10 +2628,12 @@ def _machine_age_label(mtime: float) -> str:
 def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
                   mtime: float, truncated: int, env_label: str,
                   elsewhere: list[tuple[str, list[str]]],
-                  page: Optional[tuple[int, int]] = None) -> dict[str, Any]:
+                  page: Optional[tuple[int, int]] = None,
+                  suggests: Optional[list[tuple[str, list[str]]]] = None) -> dict[str, Any]:
+    suggests = suggests or []
     open_rows = [r for r in matched if _machine_is_open(r)]
     maint_rows = [r for r in matched if not _machine_is_open(r)]
-    misses = len(not_found) + len(elsewhere)
+    misses = len(not_found) + len(elsewhere) + len(suggests)
     if matched and not misses and not maint_rows:
         template = "green"
     elif not matched or not open_rows:
@@ -2672,6 +2686,10 @@ def _machine_card(matched: list[dict[str, Any]], not_found: list[str],
         elements.append({"tag": "markdown",
                          "content": (f"💡 **{tok}** is not in {env_label} but exists in "
                                      f"{', '.join(envs)} — try `/machine {envs[0].lower()} {tok}`")})
+    for q, sims in suggests[:10]:
+        elements.append({"tag": "markdown",
+                         "content": (f"💡 No match for **{q}** — similar game types: "
+                                     f"{', '.join(sims)} (see `/machine games`)")})
     elements.append({"tag": "markdown",
                      "content": f"🕒 *Updated {_machine_age_label(mtime)}*"})
     return {
@@ -2736,6 +2754,34 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
         reply_text(chat_id, message_id, head + "\n\nScrape diagnosis:\n" + _machine_scrape_diag())
         return
     pool = rows if env_sel == "ALL" else [r for r in rows if _machine_row_env(r) == env_sel]
+    # `/machine games` — list every game type with machine counts (to find exact names).
+    if len(queries) == 1 and queries[0].lower() in ("games", "game types", "gametypes", "game type"):
+        stats: dict[str, list[Any]] = {}
+        for r in pool:
+            g = str(r.get("game_type") or "").strip()
+            ga = _machine_alnum(g)
+            if not ga:
+                continue
+            s = stats.setdefault(ga, [g, 0, 0])
+            s[1] += 1
+            s[2] += 1 if _machine_is_open(r) else 0
+        ordered = sorted(stats.values(), key=lambda s: (-s[1], s[0].lower()))
+        lines = [f"🕹️ **{disp}** — {total} machines ({op} open)"
+                 for disp, total, op in ordered[:100]]
+        if len(ordered) > 100:
+            lines.append(f"*… and {len(ordered) - 100} more game types*")
+        lines.append(f"🕒 *Updated {_machine_age_label(mtime)}*")
+        reply_card(chat_id, message_id, {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"tag": "plain_text",
+                          "content": f"🎰 Game types ({env_sel}) — {len(ordered)} games, "
+                                     f"{sum(s[1] for s in ordered)} machines"[:150]},
+                "template": "blue",
+            },
+            "elements": [{"tag": "markdown", "content": "\n".join(lines)}],
+        })
+        return
     matched, not_found = _machine_match_rows(queries, pool)
     # Misses that DO exist in another environment get a hint instead of "not found".
     elsewhere: list[tuple[str, list[str]]] = []
@@ -2751,6 +2797,24 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
             else:
                 hard_missing.append(tok)
         not_found = hard_missing
+    # For remaining misses, suggest game types sharing a word (≥2 chars) with the query.
+    suggests: list[tuple[str, list[str]]] = []
+    if not_found:
+        games: dict[str, str] = {}
+        for r in pool:
+            g = str(r.get("game_type") or "").strip()
+            ga = _machine_alnum(g)
+            if g and ga:
+                games.setdefault(ga, g)
+        hard_missing = []
+        for q in not_found:
+            words = [w for w in (_machine_alnum(x) for x in q.split()) if len(w) >= 2]
+            sims = [disp for ga, disp in games.items() if any(w in ga for w in words)]
+            if sims:
+                suggests.append((q, sims[:5]))
+            else:
+                hard_missing.append(q)
+        not_found = hard_missing
     shown = matched[:_MACHINE_MATCH_CAP]
     over = len(matched) - len(shown)
     pages = [shown[i:i + _MACHINE_PAGE] for i in range(0, len(shown), _MACHINE_PAGE)] or [[]]
@@ -2764,6 +2828,7 @@ def _do_machine(chat_id: str, message_id: str, arg: str) -> None:
             env_label=env_sel,
             elsewhere=elsewhere if last else [],
             page=(pi, len(pages)) if len(pages) > 1 else None,
+            suggests=suggests if last else None,
         )
         reply_card(chat_id, message_id, card)
 
