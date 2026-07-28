@@ -2166,14 +2166,24 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
     if not quote_body:
         quote_body = str(latest.get("body") or "")
     quote_body = quote_body.strip()
+    # Flatten '>'-style quote markers some clients/servers add when nesting
+    # replies (broken further by re-wrapping) — the history then reads like
+    # Lark's flat thread style: repeated From/Date/Subject blocks, no '>'.
+    quote_body = re.sub(r"(?m)^[ \t]*(?:>[ \t]?)+", "", quote_body)
     if REPLY_QUOTE_CHARS and len(quote_body) > REPLY_QUOTE_CHARS:
         quote_body = quote_body[:REPLY_QUOTE_CHARS] + "\n[... quoted history trimmed ...]"
-    q_from = (_decode_hdr(msg.get("From")) if msg is not None else "") or \
-        latest.get("from_raw") or ", ".join(frm)
-    q_to = (_decode_hdr(msg.get("To")) if msg is not None else "") or ", ".join(to)
-    q_cc = (_decode_hdr(msg.get("Cc")) if msg is not None else "") or ", ".join(cc)
-    q_subject = (_decode_hdr(msg.get("Subject")) if msg is not None else "") or \
-        latest.get("subject") or ""
+
+    def _unfold(s: str) -> str:
+        """RFC-folded headers keep their newlines through decoding — collapse
+        them so To/Cc lists don't break in the middle of an address."""
+        return re.sub(r"\s+", " ", (s or "").strip())
+
+    q_from = _unfold((_decode_hdr(msg.get("From")) if msg is not None else "") or
+                     latest.get("from_raw") or ", ".join(frm))
+    q_to = _unfold((_decode_hdr(msg.get("To")) if msg is not None else "") or ", ".join(to))
+    q_cc = _unfold((_decode_hdr(msg.get("Cc")) if msg is not None else "") or ", ".join(cc))
+    q_subject = _unfold((_decode_hdr(msg.get("Subject")) if msg is not None else "") or
+                        latest.get("subject") or "")
     q_ts = float(latest.get("date_ts") or 0.0)
     if q_ts > 0:
         q_date = datetime.fromtimestamp(q_ts, _local_tz()).strftime("%a, %b %d, %Y, %H:%M")
