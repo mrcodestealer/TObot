@@ -2536,6 +2536,7 @@ HELP_TEXT = (
     "  (/machine man fu bao); a venue filters (/machine mdr bao zhu zhao fu, /machine mdr);\n"
     "  /machine games lists every game type with counts (also per venue: /machine mdr games);\n"
     "  other envs: /machine qat NWR2205 · /machine all 2205\n"
+    "/whoami — your open_id + this chat_id (\"who am i\" works when tagged)\n"
     "/deploy — git pull origin main + restart the bot service\n"
     "  (natural text works too: \"git pull and restart service\")\n"
     "/scan — force a mailbox re-scan now\n"
@@ -3105,6 +3106,14 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool,
         action = lambda: _do_reply(chat_id, message_id, t[len("/reply"):])
     elif low.startswith("/machine"):
         action = lambda: _do_machine(chat_id, message_id, t[len("/machine"):])
+    elif low in ("/whoami", "/myid") or (
+        directed and re.fullmatch(r"who\s*am\s*i\s*\??|my\s*(?:open[\s_]*)?id\s*\??", low)
+    ):
+        action = lambda: reply_text(
+            chat_id, message_id,
+            f"👤 Your open_id: {sender_id or 'unknown'}\nchat_id: {chat_id}\n"
+            "(use the open_id for DEPLOY_ALLOWED_OPEN_IDS in .env)",
+        )
     elif low.startswith("/scan"):
         action = lambda: _do_scan_command(chat_id, message_id)
     elif low.startswith("/status"):
@@ -3119,6 +3128,8 @@ def _process_message(text: str, chat_id: str, message_id: str, directed: bool,
             action = lambda: _search_and_reply(chat_id, message_id, t)
     if action is None:
         return
+    # open_id printed for every command (needed for DEPLOY_ALLOWED_OPEN_IDS).
+    print(f"👤 [tobot] open_id={sender_id or '?'} chat_id={chat_id} cmd={t[:60]!r}", flush=True)
     gotit_id = add_reaction(message_id, _GOTIT_EMOJIS)
     try:
         action()
