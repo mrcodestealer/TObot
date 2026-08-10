@@ -43,6 +43,7 @@ import io
 import json
 import os
 import re
+import secrets
 import smtplib
 import ssl
 import subprocess
@@ -52,8 +53,9 @@ import threading
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from email.header import decode_header, make_header
-from email.utils import getaddresses, parsedate_to_datetime
+from email.header import Header, decode_header, make_header
+from email.mime.text import MIMEText
+from email.utils import formatdate, getaddresses, make_msgid, parseaddr, parsedate_to_datetime
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -2086,6 +2088,214 @@ _pending_replies: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 _pending_replies_lock = threading.Lock()
 
 
+# ---- Lark Mail quote block ----------------------------------------------
+# Structure ported from osedutybot's proven maintenance auto-reply
+# (maintenance_mail.py `_build_lark_quote_html` / `build_reply_message_html`,
+# lines 865-1169), which mirrors Lark's own composer output (larksuite/cli
+# mail_quote.go). Lark Mail collapses THIS markup into "Show email thread";
+# a <blockquote> does not. The reply uses the ``--collapsed`` block (folded,
+# like a manual Reply All); the previous message's ORIGINAL HTML is embedded
+# verbatim so its own nested history travels along.
+_REPLY_SEP = "---------- Original message ----------"
+_LARK_QUOTE_WRAPPER = "history-quote-wrapper"
+_LARK_REPLY_BLOCK = "adit-html-block--collapsed"
+_LARK_QUOTE_BORDER = "border-left: none; padding-left: 0px;"
+_LARK_META_STYLE = (
+    "padding: 12px; background: rgb(245, 246, 247); color: rgb(31, 35, 41); "
+    "border-radius: 4px; margin-bottom: 12px;"
+)
+_LARK_META_MARGIN = "margin-top: 2px;"
+_LARK_SEP_STYLE = "color: rgb(100, 106, 115); margin-top: 24px; margin-bottom: 8px;"
+_LARK_ADDR_STYLE = (
+    "overflow-wrap: break-word; color: inherit; text-decoration: none; "
+    "white-space: pre-wrap; hyphens: none; word-break: break-word; cursor: pointer;"
+)
+
+
+def _lark_esc(s: str) -> str:
+    return html_lib.escape(s or "", quote=False)
+
+
+def _lark_attr(s: str) -> str:
+    """Escape for use INSIDE an attribute value (quotes too)."""
+    return html_lib.escape(s or "", quote=True)
+
+
+def _gen_lark_id(prefix: str) -> str:
+    chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return prefix + "".join(secrets.choice(chars) for _ in range(6))
+
+
+def _quote_labels(subject: str) -> dict[str, str]:
+    """Chinese labels when the subject carries CJK, else English (as Lark does)."""
+    for ch in subject or "":
+        if "一" <= ch <= "鿿":
+            return {"from": "发件人", "date": "时间", "subject": "主题",
+                    "to": "收件人", "cc": "抄送", "sep": "--------- 原始邮件 ---------"}
+    return {"from": "From", "date": "Date", "subject": "Subject",
+            "to": "To", "cc": "Cc", "sep": _REPLY_SEP}
+
+
+def _address_html(from_hdr: str) -> str:
+    name, addr = parseaddr(from_hdr or "")
+    if addr:
+        e, a = _lark_esc(addr), _lark_attr(addr)   # attribute values need quote escaping
+        anchor = (f'<a class="quote-head-meta-mailto" data-mailto="mailto:{a}" '
+                  f'href="mailto:{a}" style="{_LARK_ADDR_STYLE}">{e}</a>')
+    else:
+        anchor = _lark_esc(from_hdr)
+    if name and addr:
+        return f'"{_lark_esc(name)}"&lt;{anchor}&gt;'
+    if addr:
+        return f"&lt;{anchor}&gt;"
+    return anchor
+
+
+def _meta_row(label: str, content: str) -> str:
+    return (f'<div class="lme-line-signal"><span style="">{_lark_esc(label)}: '
+            f"{content}</span></div>")
+
+
+def _body_is_html(s: str) -> bool:
+    return bool(re.search(
+        r"(?i)<(?:!doctype\s+html|!--|html|head|body|div|p|br|span|table|blockquote)", s or ""))
+
+
+# Active content and document tags that must not survive into OUR outgoing mail
+# (the quoted HTML comes from a third party and is spliced into our document).
+_UNSAFE_BLOCK_RE = re.compile(r"(?is)<(script|iframe|object|embed|noscript)\b[^>]*>.*?</\1\s*>")
+_UNSAFE_OPEN_RE = re.compile(r"(?is)</?(?:script|iframe|object|embed|noscript|meta|base|link)\b[^>]*>")
+_STRAY_DOC_RE = re.compile(r"(?is)</?(?:html|head|body)\b[^>]*>")
+_ON_ATTR_RE = re.compile(r"(?is)\son[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)")
+# cid: images point at parts we do NOT carry along — drop them instead of
+# shipping broken-image icons in the quoted history.
+_CID_IMG_RE = re.compile(r"(?is)<img\b[^>]*\bsrc\s*=\s*[\"']?\s*cid:[^>]*>")
+
+
+def _balance_divs(s: str) -> str:
+    """Make <div> open/close counts match so a malformed quote can't close OUR
+    wrapper early (which would spill the history out of the collapsible block)."""
+    opens = len(re.findall(r"(?i)<div\b", s))
+    closes = len(re.findall(r"(?i)</div\s*>", s))
+    if closes > opens:
+        for m in reversed(list(re.finditer(r"(?i)</div\s*>", s))[-(closes - opens):]):
+            s = s[:m.start()] + s[m.end():]
+    elif opens > closes:
+        s += "</div>" * (opens - closes)
+    return s
+
+
+def _sanitize_embedded_html(html: str) -> str:
+    """Drop outer document wrappers so nested HTML doesn't break Lark quote detection.
+
+    Beyond osedutybot's wrapper stripping this also removes active content and
+    balances <div>s — the quoted mail is third-party HTML spliced into our own
+    document, and an unbalanced </div> would close the collapsible block early.
+    """
+    t = (html or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"(?is)<!DOCTYPE[^>]*>", "", t)
+    t = re.sub(r"(?is)<head\b[^>]*>.*?</head>", "", t)
+    m = re.search(r"(?is)<body\b[^>]*>(.*)</body>", t)
+    if m:
+        t = m.group(1)
+    t = _UNSAFE_BLOCK_RE.sub("", t)
+    t = _UNSAFE_OPEN_RE.sub("", t)
+    t = _STRAY_DOC_RE.sub("", t)          # leftovers from malformed documents
+    t = _ON_ATTR_RE.sub("", t)            # onclick=… and friends
+    t = _CID_IMG_RE.sub("", t)            # images whose parts we don't attach
+    return _balance_divs(t.strip()).strip()
+
+
+def _first_html_part(part: email.message.Message) -> Optional[email.message.Message]:
+    """First real text/html body part, WITHOUT descending into attached mails
+    (an attached .eml carries its own text/html that is not this message's body)."""
+    ctype = (part.get_content_type() or "").lower()
+    if ctype == "message/rfc822":
+        return None
+    if part.is_multipart():
+        payload = part.get_payload()
+        for sub in payload if isinstance(payload, list) else []:
+            if isinstance(sub, email.message.Message):
+                got = _first_html_part(sub)
+                if got is not None:
+                    return got
+        return None
+    if ctype != "text/html":
+        return None
+    if "attachment" in str(part.get("Content-Disposition") or "").lower():
+        return None
+    return part
+
+
+def extract_body_html_raw(msg: email.message.Message) -> Optional[str]:
+    """The message's OWN text/html body, NOT converted to text."""
+    part = _first_html_part(msg)
+    if part is None:
+        # Single-part text/html marked as an attachment is still the body
+        # (matches osedutybot, which does not check the disposition there).
+        if msg.is_multipart() or (msg.get_content_type() or "").lower() != "text/html":
+            return None
+        part = msg
+    try:
+        payload = part.get_payload(decode=True)
+    except Exception:
+        return None
+    if not payload:
+        return None
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace").strip() or None
+    except (LookupError, UnicodeDecodeError):
+        return payload.decode("utf-8", errors="replace").strip() or None
+
+
+def _build_lark_reply_quote_html(*, from_hdr: str, date_line: str, subject: str,
+                                 to_hdr: str, cc_hdr: str, body_html: str) -> str:
+    """The collapsible quote block itself (Lark renders it as Show/Hide email thread)."""
+    labels = _quote_labels(subject)
+    rows = [_meta_row(labels["from"], _address_html(from_hdr))]
+    if date_line:
+        rows.append(_meta_row(labels["date"], _lark_esc(date_line)))
+    if subject:
+        rows.append(_meta_row(labels["subject"], _lark_esc(subject)))
+    rows.append(_meta_row(labels["to"], _lark_esc(to_hdr)))
+    if cc_hdr:
+        rows.append(_meta_row(labels["cc"], _lark_esc(cc_hdr)))
+    meta_html = (
+        f'<div id="{_gen_lark_id("lark-mail-meta-cli")}" class="adit-html-block__header '
+        'history-quote-meta-after-forward-title history-quote-meta-wrapper" '
+        f'style="{_LARK_META_MARGIN} {_LARK_META_STYLE}">'
+        f'<div style="word-break: break-word;">{"".join(rows)}</div></div>'
+    )
+    sep_html = ('<div class="history-quote-forward-title lme-line-signal history-quote-gap-tag" '
+                f'style="{_LARK_SEP_STYLE}">{_lark_esc(labels["sep"])}</div>')
+    body_part = f"<div>{body_html}</div>" if body_html else ""
+    return (
+        f'<div id="{_gen_lark_id("lark-mail-quote-cli")}" class="{_LARK_QUOTE_WRAPPER}">'
+        '<div data-html-block="quote" data-mail-html-ignore="">'
+        f'<div class="adit-html-block {_LARK_REPLY_BLOCK}" style="{_LARK_QUOTE_BORDER}">'
+        f'<div id="{_gen_lark_id("lark-mail-quote-cli")}">{sep_html}{meta_html}{body_part}</div>'
+        "</div></div></div>"
+    )
+
+
+def _build_reply_html(text: str, quote_html: str) -> str:
+    """Full reply document: our text on top, the collapsible quote below."""
+    body_html = "<br>".join(
+        _lark_esc(line) for line in (text or "").replace("\r\n", "\n").split("\n"))
+    top = ('<div style="word-break:break-word;line-height:1.6;'
+           f'font-size:14px;color:rgb(0,0,0);">{body_html}</div>')
+    gap = ('<div style="word-break:break-word;line-height:1.6;'
+           'font-size:14px;color:rgb(0,0,0);"><br></div>')
+    return ("<!DOCTYPE html><html><head>"
+            '<meta http-equiv="Content-Type" content="text/html; charset=utf-8">'
+            "</head><body>"
+            f'<div dir="ltr">{top}{gap}{quote_html}</div>'
+            "</body></html>")
+
+
 def _own_addresses() -> set[str]:
     return {a.strip().casefold() for a in (MAIL_USER,) if a.strip()}
 
@@ -2188,15 +2398,35 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
     if q_ts > 0:
         q_date = datetime.fromtimestamp(q_ts, _local_tz()).strftime("%a, %b %d, %Y, %H:%M")
     else:
-        q_date = ((msg.get("Date") or "").strip() if msg is not None else "") or "?"
+        # Empty when unknown — the quote builder then omits the Date row entirely
+        # (osedutybot does the same); only the plain-text header shows a "?".
+        q_date = (msg.get("Date") or "").strip() if msg is not None else ""
     quote_header_lines = [
         f"From: {q_from}".strip(),
-        f"Date: {q_date}",
+        f"Date: {q_date or '?'}",
         f"Subject: {q_subject}".rstrip(),
         f"To: {q_to}".rstrip(),
     ]
     if q_cc.strip():
         quote_header_lines.append(f"Cc: {q_cc}")
+    # The collapsible Lark quote, built once here (the fetched message is not
+    # kept around until the user presses Send). The previous mail's ORIGINAL
+    # HTML is embedded so its own history/formatting survives; plain-text-only
+    # mails fall back to <pre>.
+    quote_html = ""
+    if REPLY_QUOTE_CHARS:
+        raw_html = extract_body_html_raw(msg) if msg is not None else None
+        inner = _sanitize_embedded_html(raw_html) if raw_html and _body_is_html(raw_html) else ""
+        if len(inner) > REPLY_QUOTE_CHARS * 10:   # runaway thread → text fallback
+            inner = ""
+        if not inner and quote_body:
+            inner = f'<pre style="white-space:pre-wrap">{_lark_esc(quote_body)}</pre>'
+        # Built even when the body came out empty (attachment-only mail): the
+        # header block alone still gives the collapsible thread, as upstream does.
+        quote_html = _build_lark_reply_quote_html(
+            from_hdr=q_from, date_line=q_date, subject=q_subject,
+            to_hdr=q_to, cc_hdr=q_cc, body_html=inner,
+        )
     mid = (latest.get("message_id") or "").strip()
     return {
         "title": entries[0].get("subject") or latest.get("subject") or "",
@@ -2206,6 +2436,7 @@ def _compute_reply_spec(mail: Optional[imaplib.IMAP4],
         "removed": removed,
         "quote_body": quote_body,
         "quote_header": "\n".join(quote_header_lines),
+        "quote_html": quote_html,
         "in_reply_to": mid,
         "references": (f"{references} {mid}".strip() if mid else references),
         "latest_from": latest.get("from_raw") or ", ".join(frm) or "?",
@@ -2384,48 +2615,38 @@ def _do_reply(chat_id: str, message_id: str, arg: str) -> None:
 
 
 def send_reply_email(spec: dict[str, Any], content: str) -> None:
-    """One SMTP reply-all send. Raises on failure."""
-    msg = email.message.EmailMessage()
+    """One SMTP reply-all send. Raises on failure.
+
+    With a quote: a SINGLE ``text/html`` part carrying Lark's own quote markup,
+    so Lark Mail folds the history into **Show/Hide email thread** exactly like
+    a manual Reply All (osedutybot's proven approach — adding a plain-text
+    alternative makes Lark expand the quote as raw text instead). Without a
+    quote it stays a plain-text mail.
+    """
+    content = (content or "").strip()
+    quote_html = (spec.get("quote_html") or "") if REPLY_QUOTE_CHARS else ""
+    if quote_html:
+        msg: email.message.Message = MIMEText(
+            _build_reply_html(content, quote_html), "html", "utf-8")
+        msg.replace_header("Content-Type", 'text/html; charset="utf-8"')
+    else:
+        quote = (spec.get("quote_body") or "").strip()
+        header = (spec.get("quote_header") or "").strip()
+        body = content
+        if REPLY_QUOTE_CHARS and quote:
+            body = f"{body}\n\n\n{header}\n\n{quote}" if header else f"{body}\n\n\n{quote}"
+        msg = MIMEText(body + "\n", "plain", "utf-8")
+    msg["Subject"] = Header(spec["subject"], "utf-8")
     msg["From"] = MAIL_USER
     msg["To"] = ", ".join(spec["to"])
     if spec["cc"]:
         msg["Cc"] = ", ".join(spec["cc"])
-    msg["Subject"] = spec["subject"]
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
     if spec.get("in_reply_to"):
         msg["In-Reply-To"] = spec["in_reply_to"]
     if spec.get("references"):
         msg["References"] = spec["references"]
-    # The card's text box holds the WHOLE body (template pre-filled) — sent as
-    # typed, with the thread's latest message quoted below (From/Date/Subject/
-    # To/Cc block + body). The HTML alternative wraps the history in a
-    # <blockquote>, which Lark Mail collapses into "Show email thread"
-    # (plain text alone renders inline — clients can't detect the quote there).
-    content = content.strip()
-    quote = (spec.get("quote_body") or "").strip()
-    header = (spec.get("quote_header") or "").strip()
-    body = content
-    if REPLY_QUOTE_CHARS and quote:
-        body = f"{body}\n\n\n{header}\n\n{quote}" if header else f"{body}\n\n\n{quote}"
-    msg.set_content(body + "\n")
-    if REPLY_QUOTE_CHARS and quote:
-        def _h(s: str) -> str:
-            return html_lib.escape(s).replace("\n", "<br>\n")
-
-        # Lark-native look: the collapsible section holds the From/Date/Subject/
-        # To/Cc block in a gray rounded box, with the quoted body plain below it
-        # (no bordered blockquote). The <blockquote> wrapper stays borderless —
-        # it is what mail clients key on for the "Show email thread" collapse.
-        msg.add_alternative(
-            "<html><body>"
-            f"<div>{_h(content)}</div><br>"
-            '<blockquote style="margin:0;border:none;padding:0">'
-            + (('<div style="background:rgba(127,127,127,0.15);border-radius:8px;'
-                f'padding:12px 16px">{_h(header)}</div><br>') if header else "")
-            + f"<div>{_h(quote)}</div>"
-            "</blockquote>"
-            "</body></html>",
-            subtype="html",
-        )
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(MAIL_SMTP_HOST, MAIL_SMTP_PORT, context=ctx, timeout=60) as smtp:
         smtp.login(MAIL_USER, MAIL_PASSWORD)
@@ -2445,6 +2666,10 @@ def _send_reply_batch(batch: dict[str, Any], content: str) -> None:
             print(f"[reply] send failed for {s['title']!r}: {ex!r}", flush=True)
             results.append(f"  ❌ {s['title']} — {ex!r}")
     batch["state"] = "sent"
+    # Quoted HTML can be ~100 KB per thread — drop it once sent (batches live 24h).
+    for s in batch["specs"]:
+        s["quote_html"] = ""
+        s["quote_body"] = ""
     summary = (f"📤 Reply sent to {ok_count}/{len(batch['specs'])} email(s) "
                f"from {MAIL_USER}:\n" + "\n".join(results))
     reply_text(batch["chat_id"], "", summary)
@@ -2489,6 +2714,9 @@ def _on_card_action(data):
             batch = _reply_batch_claim(batch_id, "cancelled")
             if batch is None:
                 return respond("warning", "Already sent or cancelled")
+            for s in batch["specs"]:
+                s["quote_html"] = ""
+                s["quote_body"] = ""
             return respond("success", "Cancelled — nothing was sent",
                            _reply_done_card("❌ **Cancelled** — no email was sent.", "red"))
         form = getattr(action, "form_value", None) or {}
@@ -2931,12 +3159,25 @@ def _machine_scrape_diag() -> str:
             return "loop running, first scrape pass hasn't finished yet"
         return ("loop thread NOT running — the bot started without it; "
                 "check startup logs for '[webmachine]' lines and restart")
-    head = f"last pass {_machine_age_label(ts)}: {nrows} machines, {len(errs)} backend errors"
+    raw_n = getattr(_wm, "_scrape_raw_count", -1)
+    counts = dict(getattr(_wm, "_scrape_counts", {}) or {})
+    head = f"last pass {_machine_age_label(ts)}: {nrows} machines, {len(errs)} backend notes"
+    if raw_n >= 0 and raw_n != nrows:
+        head += f" (scraper returned {raw_n} raw rows)"
     if errs:
-        shown = [f"• {k}: {str(v)[:160]}" for k, v in list(errs.items())[:5]]
-        if len(errs) > 5:
-            shown.append(f"• … +{len(errs) - 5} more backends with errors")
+        shown = [f"• {k}: {str(v)[:160]}" for k, v in list(errs.items())[:8]]
+        if len(errs) > 8:
+            shown.append(f"• … +{len(errs) - 8} more")
         head += "\n" + "\n".join(shown)
+    if counts:
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+        head += "\nrows per backend: " + ", ".join(f"{k}={v}" for k, v in top)
+    elif raw_n == 0:
+        head += ("\nEvery backend logged in without error but returned an EMPTY machine table — "
+                 "check the EGM list path (SM_MACHINE_PATH, default /egm/egmStatusList) and that "
+                 "the backend accounts can see machines. Test one backend on the server:\n"
+                 "  python -c \"import smmachine;r,w=smmachine.smachine_collect_all_machine_rows('cp');"
+                 "print(len(r),w)\"")
     return head
 
 

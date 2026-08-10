@@ -37,6 +37,11 @@ _scrape_errs: dict[str, str] = {}
 _scrape_ts: float = 0.0
 _bg_started = False
 _bg_lock = threading.Lock()
+# Extra diagnostics (TObot addition): rows as returned by smmachine BEFORE
+# normalization, and per-backend row counts — tells "nothing scraped" apart
+# from "scraped but normalization dropped everything".
+_scrape_raw_count: int = -1
+_scrape_counts: dict[str, int] = {}
 
 
 def _truthy_env(name: str) -> bool:
@@ -174,6 +179,31 @@ def _run_scrape_once() -> None:
         raw_rows, errs = smachine_collect_machines_all_deployments()
     except Exception as e:
         raw_rows, errs = [], {"_fatal": repr(e)}
+    # TObot addition: the warm-pool path scrapes a long-lived page and returns an
+    # EMPTY table (no exception) whenever that page drifted off the EGM list —
+    # looks like "0 machines, no errors". The one-shot path does a full login per
+    # pass, so retry once with the pool disabled rather than persisting nothing.
+    if not raw_rows and (os.environ.get("WEBMACHINE_WARM_POOL") or "1").strip().lower() \
+            not in ("0", "false", "no", "off"):
+        print("[webmachine] warm pool returned 0 rows — retrying one-shot (cold) scrape",
+              flush=True)
+        os.environ["WEBMACHINE_WARM_POOL"] = "0"
+        try:
+            raw_rows, cold_errs = smachine_collect_machines_all_deployments()
+            errs = dict(cold_errs)
+            errs["_warm_fallback"] = f"warm pool gave 0 rows; one-shot scrape returned {len(raw_rows)}"
+        except Exception as e:
+            errs["_warm_fallback"] = f"one-shot retry failed: {e!r}"
+        finally:
+            os.environ["WEBMACHINE_WARM_POOL"] = "1"
+    global _scrape_raw_count, _scrape_counts
+    _scrape_raw_count = len(raw_rows) if isinstance(raw_rows, list) else -1
+    counts: dict[str, int] = {}
+    for r in raw_rows if isinstance(raw_rows, list) else []:
+        if isinstance(r, dict):
+            key = f"{r.get('deployment') or r.get('environment') or '?'}:{r.get('belongs') or '?'}"
+            counts[key] = counts.get(key, 0) + 1
+    _scrape_counts = counts
     norm = _normalize_rows(raw_rows)
     norm.sort(
         key=lambda r: (
